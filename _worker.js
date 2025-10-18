@@ -1,29 +1,45 @@
-// Cloudflare Worker: ZVA <-> WinTeam / Monday bridge (Option A)
+// Cloudflare Worker: ZVA <-> WinTeam / Monday bridge (Option A + Monday column mapping)
+//
 // Endpoints:
 //  - POST /auth/employee   : verify employeeNumber + ssnLast4; return select fields
 //  - POST /winteam/shifts  : get shifts via shiftDetails; return speakable + entries + mondayShiftText
 //  - POST /monday/write    : create Monday item + set columns; optional idempotency via KV (FLOW_GUARD)
 //
-// Required secrets:
-//   WINTEAM_TENANT_ID
-//   WINTEAM_API_KEY
-//   MONDAY_API_KEY
-// Optional secrets:
-//   MONDAY_DEFAULT_BOARD_ID
-//   FLOW_GUARD_TTL_SECONDS (default 86400)
-// Optional KV binding (for idempotency): FLOW_GUARD
+// Required secrets: WINTEAM_TENANT_ID, WINTEAM_API_KEY, MONDAY_API_KEY
+// Optional secrets: MONDAY_DEFAULT_BOARD_ID, FLOW_GUARD_TTL_SECONDS
+// Optional KV binding: FLOW_GUARD
 //
 // Deploy URL example: https://secureonev2.rdyla.workers.dev
 
 // ------------------- WinTeam endpoints -------------------
 const EMPLOYEE_BASE =
   "http://apim.myteamsoftware.com/wtnextgen/employees/v1/api/employees";
-
 const SHIFTS_BASE_EXACT =
   "http://apim.myteamsoftware.com/wtnextgen/schedules/v1/api/shiftDetails";
 
 // ------------------- Monday.com endpoint -------------------
 const MONDAY_API_URL = "https://api.monday.com/v2";
+
+// ------------------- Monday column map (friendly → columnId) -------------------
+const MONDAY_COLUMN_MAP = {
+  // name column is set via itemName, not column values
+  division: "color_mktd81zp",           // "Division:"
+  department: "color_mktsk31h",         // "Department"
+  site: "text_mktj4gmt",                // "Account/Site:"
+  email: "email_mktdyt3z",              // "Email Address:"
+  phone: "phone_mktdphra",              // "Phone Number:"
+  callerId: "phone_mkv0p9q3",           // "Caller ID:"
+  reason: "text_mktdb8pg",              // "Call Issue/Reason:"
+  timeInOut: "text_mktsvsns",           // "Time In/Out:"
+  startTime: "text_mkv0t29z",           // "Start Time (if applicable):"
+  endTime: "text_mkv0nmq1",             // "End Time (if applicable)"
+  dateTime: "date4",                    // "Date/Time:" (Monday date column)
+  deptEmail: "text_mkv07gad",           // "Department Email:"
+  emailStatus: "color_mkv0cpxc",        // "Email Status:"
+  itemIdEcho: "pulse_id_mkv6rhgy",      // (usually auto; rarely set)
+  zoomGuid: "text_mkv7j2fq",            // "Zoom Call GUID"
+  shift: "text_mkwn6bzw",               // "Shift"
+};
 
 // ------------------- tiny utils -------------------
 const json = (obj, { status = 200, cors = true } = {}) =>
@@ -232,8 +248,7 @@ async function handleShifts(req, env) {
     );
   }
 
-  // Shape:
-  // data[0].results[*] => { jobDescription, postDescription, utCoffset, shifts: [{startTime, endTime, ...}] }
+  // Shape: data[0].results[*] => { jobDescription, postDescription, utCoffset, shifts: [{startTime, endTime, ...}] }
   const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
   const results = Array.isArray(page?.results) ? page.results : [];
 
@@ -329,6 +344,59 @@ async function handleShifts(req, env) {
   });
 }
 
+// Build column_values from either raw columnValues or friendly fields
+function buildMondayColumnsFromFriendly(body) {
+  const out = {};
+  const addIf = (friendlyKey, transform = (v) => v) => {
+    if (body[friendlyKey] != null && body[friendlyKey] !== "") {
+      const colId = MONDAY_COLUMN_MAP[friendlyKey];
+      if (colId) out[colId] = transform(body[friendlyKey]);
+    }
+  };
+
+  // Strings are fine for most types. You can supply richer objects if desired.
+  addIf("division");
+  addIf("department");
+  addIf("site");
+  addIf("email");
+  addIf("phone");
+  addIf("callerId");
+  addIf("reason");
+  addIf("timeInOut");
+  addIf("startTime");
+  addIf("endTime");
+  addIf("deptEmail");
+  addIf("emailStatus");
+  addIf("zoomGuid");
+  addIf("shift");
+
+  // Date column allows JSON like {date:"YYYY-MM-DD", time:"HH:MM:SS"}.
+  // Accept plain strings too.
+  if (body.dateTime) {
+    const v = body.dateTime;
+    if (typeof v === "object" && (v.date || v.time)) {
+      out[MONDAY_COLUMN_MAP.dateTime] = v;
+    } else {
+      // try to parse ISO and split
+      const ts = Date.parse(String(v));
+      if (!isNaN(ts)) {
+        const d = new Date(ts);
+        out[MONDAY_COLUMN_MAP.dateTime] = {
+          date: `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`,
+          time: `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`
+        };
+      } else {
+        out[MONDAY_COLUMN_MAP.dateTime] = String(v);
+      }
+    }
+  }
+
+  // Echo item id if you want (rare)
+  if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
+
+  return out;
+}
+
 async function handleMondayWrite(req, env) {
   const body = await readJson(req);
   if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
@@ -336,12 +404,18 @@ async function handleMondayWrite(req, env) {
   const boardId = Number(body.boardId || env.MONDAY_DEFAULT_BOARD_ID);
   const itemName = trim(body.itemName || body.name || "");
   const groupId = trim(body.groupId || "");
-  const columnValues = body.columnValues || {}; // { colId: value, ... }
   const dedupeKey = trim(body.dedupeKey || body.engagementId || "");
 
   if (!boardId || !itemName) {
     return json({ success: false, message: "boardId and itemName are required." }, { status: 400 });
   }
+
+  // Build columns:
+  // 1) start with friendly field mapping
+  const fromFriendly = buildMondayColumnsFromFriendly(body);
+  // 2) merge any explicit columnValues (explicit wins)
+  let explicit = body.columnValues && typeof body.columnValues === "object" ? body.columnValues : {};
+  const columnValues = { ...fromFriendly, ...explicit };
 
   // Optional idempotency
   if (dedupeKey && (await flowGuardSeen(env, dedupeKey))) {
@@ -351,6 +425,7 @@ async function handleMondayWrite(req, env) {
       dedupeKey,
       upserted: false,
       item: null,
+      columnValues // echo back what we would have sent
     });
   }
 
@@ -377,8 +452,8 @@ async function handleMondayWrite(req, env) {
     return json({ success: false, message: "Monday create_item failed.", detail: String(e) }, { status: 502 });
   }
 
-  // 2) Set columns
-  if (columnValues && typeof columnValues === "object" && Object.keys(columnValues).length) {
+  // 2) Set columns (if any)
+  if (Object.keys(columnValues).length) {
     const changeMutation = `
       mutation ($boardId: Int!, $itemId: Int!, $cv: JSON!) {
         change_multiple_column_values (board_id: $boardId, item_id: $itemId, column_values: $cv) {
@@ -410,6 +485,7 @@ async function handleMondayWrite(req, env) {
     boardId,
     item: created,
     dedupeKey: dedupeKey || null,
+    columnValuesSent: columnValues
   });
 }
 
