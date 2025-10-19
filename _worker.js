@@ -98,6 +98,14 @@ function ymdFromDate(d) {
   return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
 }
 
+// Central default (adjust if your tenant is in a different home timezone)
+function nowCentral() {
+  // naive approach: "now" in UTC minus 5 hours; good enough for a rolling window
+  const d = new Date();
+  d.setUTCHours(d.getUTCHours() - 5);
+  return d;
+}
+
 ///////////////////////////////
 // Logging (PII-safe)
 ///////////////////////////////
@@ -320,8 +328,15 @@ async function handleShifts(req, env) {
     return json({ success: false, message: "employeeNumber is required." }, { status: 400 });
   }
 
+  // Always ask WinTeam for a 15-day window, based on "central" now
+  const startBase = nowCentral();                 // tenant home tz anchor (tweak if needed)
+  const fromDate = ymd(startBase);                // YYYY-MM-DD (today)
+  const toDate   = ymd(addDaysUTC(startBase, 15)); // +15 days
+
   const url = new URL(SHIFTS_BASE_EXACT);
   url.searchParams.set("employeeNumber", employeeNumber);
+  url.searchParams.set("fromDate", fromDate);   
+  url.searchParams.set("toDate", toDate);       
 
   const wt = await callWinTeamJSON(url.toString(), env);
   if (!wt.ok) {
