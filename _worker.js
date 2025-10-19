@@ -7,10 +7,10 @@
 //  - GET  /debug/env           (optional: shows which bindings exist; no values)
 //
 // Required secrets: WINTEAM_TENANT_ID, WINTEAM_API_KEY, MONDAY_API_KEY
-// Optional secrets: MONDAY_DEFAULT_BOARD_ID, FLOW_GUARD_TTL_SECONDS
+// Optional secrets: MONDAY_BOARD_ID, MONDAY_DEFAULT_BOARD_ID, FLOW_GUARD_TTL_SECONDS
 // Optional KV binding: FLOW_GUARD
 //
-// wrangler.toml (example):
+// wrangler.toml example:
 // name = "secureonev2"
 // main = "_worker.js"
 // compatibility_date = "2025-10-18"
@@ -24,8 +24,8 @@ const SHIFTS_BASE_EXACT = "http://apim.myteamsoftware.com/wtnextgen/schedules/v1
 const MONDAY_API_URL = "https://api.monday.com/v2";
 
 const MONDAY_COLUMN_MAP = {
-  division: "color_mktd81zp",     // "Division:"
-  department: "color_mktsk31h",   // "Department"
+  division: "color_mktd81zp",     // "Division:" (Status)
+  department: "color_mktsk31h",   // "Department" (Status)
   site: "text_mktj4gmt",          // "Account/Site:"
   email: "email_mktdyt3z",        // "Email Address:"
   phone: "phone_mktdphra",        // "Phone Number:"
@@ -36,7 +36,7 @@ const MONDAY_COLUMN_MAP = {
   endTime: "text_mkv0nmq1",       // "End Time (if applicable)"
   dateTime: "date4",              // "Date/Time:"
   deptEmail: "text_mkv07gad",     // "Department Email:"
-  emailStatus: "color_mkv0cpxc",  // "Email Status:"
+  emailStatus: "color_mkv0cpxc",  // "Email Status:" (Status if used)
   itemIdEcho: "pulse_id_mkv6rhgy",
   zoomGuid: "text_mkv7j2fq",
   shift: "text_mkwn6bzw"
@@ -45,99 +45,6 @@ const MONDAY_COLUMN_MAP = {
 ///////////////////////////////
 // Tiny utils
 ///////////////////////////////
-// --- helpers: drop these near your other small utils ---
-function deriveDepartmentFromReason(reasonRaw = "") {
-  const r = String(reasonRaw).toLowerCase();
-
-  // Payroll first (pay/payroll/check)
-  if (/\b(payroll|pay\s*issue|pay\s*check|pay\s*stub|w2|w-?2|tax|withhold)/i.test(r)) return "Payroll";
-
-  // Training keywords
-  if (/\b(training|train|course|lms|cert|certificate|guard\s*card)/i.test(r)) return "Training";
-
-  // Ops-y catch: call offs, incidents, punches, timecards
-  if (
-    /\b(call\s*off|calloff|no\s*show|incident|report|time\s*card|timecard|punch|missed\s*punch|late|coverage|schedule)/i.test(r)
-  ) return "Operations";
-
-  return "Other";
-}
-
-function mondayStatusLabel(label) {
-  const v = String(label || "").trim();
-  return v ? { label: v } : undefined;
-}
-
-// --- replace your existing buildMondayColumnsFromFriendly with this ---
-function buildMondayColumnsFromFriendly(body) {
-  const out = {};
-  const addIf = (friendlyKey, transform = (v) => v) => {
-    if (body[friendlyKey] != null && body[friendlyKey] !== "") {
-      const colId = MONDAY_COLUMN_MAP[friendlyKey];
-      if (colId) out[colId] = transform(body[friendlyKey]);
-    }
-  };
-
-  // 1) Plain text-ish fields
-  addIf("site");        // Account/Site: text
-  addIf("reason");      // Call Issue/Reason: text
-  addIf("timeInOut");
-  addIf("startTime");
-  addIf("endTime");
-  addIf("deptEmail");
-  addIf("emailStatus"); // If this is also a status column in your board, convert it to {label:...} like below
-  addIf("zoomGuid");
-  addIf("shift");
-  if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
-
-  // 2) EMAIL → { email, text }
-  addIf("email", (v) => {
-    const email = String(v).trim();
-    if (!email || !/@/.test(email)) return undefined;
-    return { email, text: email };
-  });
-
-  // 3) PHONE / CALLER ID → { phone, countryShortName }
-  const normPhone = (raw) => String(raw).replace(/[^\d+]/g, "").trim();
-  addIf("phone",   (v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
-  addIf("callerId",(v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
-
-  // 4) DATE/TIME
-  if (body.dateTime) {
-    const v = body.dateTime;
-    if (typeof v === "object" && (v.date || v.time)) {
-      out[MONDAY_COLUMN_MAP.dateTime] = v;
-    } else {
-      const ts = Date.parse(String(v));
-      if (!isNaN(ts)) {
-        const d = new Date(ts);
-        out[MONDAY_COLUMN_MAP.dateTime] = {
-          date: `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`,
-          time: `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}:${String(d.getUTCSeconds()).padStart(2,"0")}`
-        };
-      }
-    }
-  }
-
-  // 5) DIVISION (status column) — prefer explicit, else derive from ofcWorkstate/workState/state
-  const explicitDivision = String(body.division || "").trim();
-  let divisionSource = explicitDivision ||
-                       String(body.ofcWorkstate || body.workState || body.state || "").trim();
-  if (divisionSource) {
-    out[MONDAY_COLUMN_MAP.division] = mondayStatusLabel(divisionSource);
-  }
-
-  // 6) DEPARTMENT (status column) — prefer explicit, else derive from reason
-  const explicitDept = String(body.department || "").trim();
-  const dept = explicitDept || deriveDepartmentFromReason(body.reason || "");
-  if (dept) {
-    out[MONDAY_COLUMN_MAP.department] = mondayStatusLabel(dept);
-  }
-
-  // Remove undefined values
-  for (const k of Object.keys(out)) { if (out[k] === undefined) delete out[k]; }
-  return out;
-}
 
 const json = (obj, { status = 200, cors = true } = {}) =>
   new Response(JSON.stringify(obj, null, 2), {
@@ -189,14 +96,6 @@ function weekdayMonthDay(d) {
 }
 function ymdFromDate(d) {
   return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
-}
-
-// Central default (adjust if your tenant is in a different home timezone)
-function nowCentral() {
-  // naive approach: "now" in UTC minus 5 hours; good enough for a rolling window
-  const d = new Date();
-  d.setUTCHours(d.getUTCHours() - 5);
-  return d;
 }
 
 ///////////////////////////////
@@ -271,33 +170,6 @@ function withLogging(handler) {
 ///////////////////////////////
 // HTTP helpers
 ///////////////////////////////
-// Map state postal codes to full names for Monday "Division:" status labels
-const STATE_FULL = {
-  AL:"Alabama", AK:"Alaska", AZ:"Arizona", AR:"Arkansas", CA:"California",
-  CO:"Colorado", CT:"Connecticut", DE:"Delaware", FL:"Florida", GA:"Georgia",
-  HI:"Hawaii", ID:"Idaho", IL:"Illinois", IN:"Indiana", IA:"Iowa",
-  KS:"Kansas", KY:"Kentucky", LA:"Louisiana", ME:"Maine", MD:"Maryland",
-  MA:"Massachusetts", MI:"Michigan", MN:"Minnesota", MS:"Mississippi", MO:"Missouri",
-  MT:"Montana", NE:"Nebraska", NV:"Nevada", NH:"New Hampshire", NJ:"New Jersey",
-  NM:"New Mexico", NY:"New York", NC:"North Carolina", ND:"North Dakota", OH:"Ohio",
-  OK:"Oklahoma", OR:"Oregon", PA:"Pennsylvania", RI:"Rhode Island", SC:"South Carolina",
-  SD:"South Dakota", TN:"Tennessee", TX:"Texas", UT:"Utah",
-  VT:"Vermont", VA:"Virginia", WA:"Washington", WV:"West Virginia",
-  WI:"Wisconsin", WY:"Wyoming", DC:"District of Columbia", PR:"Puerto Rico"
-};
-
-function stateFromSupervisor(supervisorDescription = "") {
-  // Examples: "IL Ops Team", "AZ Operations", "TX Night Shift"
-  const m = String(supervisorDescription).trim().match(/^([A-Z]{2})\b/);
-  if (!m) return "";
-  const full = STATE_FULL[m[1]];
-  return full || "";
-}
-
-function mondayStatusLabel(label) {
-  const v = String(label || "").trim();
-  return v ? { label: v } : undefined;
-}
 
 async function readJson(req) {
   try {
@@ -382,7 +254,6 @@ async function flowGuardMark(env, key) {
 ///////////////////////////////
 
 // Parse "YYYY-MM-DDTHH:mm:ss" (no TZ) as a *local wall-clock* Date in UTC frame.
-// This avoids treating the naive string as real UTC and keeps comparisons consistent.
 function parseNaiveAsLocalWall(isoNoTZ) {
   const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(isoNoTZ));
   if (!m) return null;
@@ -391,6 +262,51 @@ function parseNaiveAsLocalWall(isoNoTZ) {
     Number(Y), Number(M) - 1, Number(D),
     Number(h), Number(min), Number(s || 0)
   ));
+}
+
+// Tenant "home" anchor for WinTeam windowing; adjust if your org prefers another tz.
+// Using UTC is acceptable; we also locally filter per-row using utCoffset.
+function nowAnchor() {
+  return new Date(); // UTC "now"
+}
+
+///////////////////////////////
+// Division/Department helpers
+///////////////////////////////
+
+const STATE_FULL = {
+  AL:"Alabama", AK:"Alaska", AZ:"Arizona", AR:"Arkansas", CA:"California",
+  CO:"Colorado", CT:"Connecticut", DE:"Delaware", FL:"Florida", GA:"Georgia",
+  HI:"Hawaii", ID:"Idaho", IL:"Illinois", IN:"Indiana", IA:"Iowa",
+  KS:"Kansas", KY:"Kentucky", LA:"Louisiana", ME:"Maine", MD:"Maryland",
+  MA:"Massachusetts", MI:"Michigan", MN:"Minnesota", MS:"Mississippi", MO:"Missouri",
+  MT:"Montana", NE:"Nebraska", NV:"Nevada", NH:"New Hampshire", NJ:"New Jersey",
+  NM:"New Mexico", NY:"New York", NC:"North Carolina", ND:"North Dakota", OH:"Ohio",
+  OK:"Oklahoma", OR:"Oregon", PA:"Pennsylvania", RI:"Rhode Island", SC:"South Carolina",
+  SD:"South Dakota", TN:"Tennessee", TX:"Texas", UT:"Utah",
+  VT:"Vermont", VA:"Virginia", WA:"Washington", WV:"West Virginia",
+  WI:"Wisconsin", WY:"Wyoming", DC:"District of Columbia", PR:"Puerto Rico"
+};
+
+function stateFromSupervisor(supervisorDescription = "") {
+  // Examples: "IL Ops Team", "AZ Operations", "TX Night Shift"
+  const m = String(supervisorDescription).trim().match(/^([A-Z]{2})\b/);
+  if (!m) return "";
+  const full = STATE_FULL[m[1]];
+  return full || "";
+}
+
+function deriveDepartmentFromReason(reasonRaw = "") {
+  const r = String(reasonRaw).toLowerCase();
+  if (/\b(payroll|pay\s*issue|pay\s*check|pay\s*stub|w2|w-?2|tax|withhold)/i.test(r)) return "Payroll";
+  if (/\b(training|train|course|lms|cert|certificate|guard\s*card)/i.test(r)) return "Training";
+  if (/\b(call\s*off|calloff|no\s*show|incident|report|time\s*card|timecard|punch|missed\s*punch|late|coverage|schedule)/i.test(r)) return "Operations";
+  return "Other";
+}
+
+function mondayStatusLabel(label) {
+  const v = String(label || "").trim();
+  return v ? { label: v } : undefined;
 }
 
 ///////////////////////////////
@@ -426,6 +342,7 @@ async function handleAuthEmployee(req, env) {
   const payload = {
     firstName: trim(match.firstName),
     lastName: trim(match.lastName),
+    ofcFullname: [trim(match.firstName), trim(match.lastName)].filter(Boolean).join(" "),
     emailAddress: trim(match.emailAddress),
     phone1: normalizeUsPhone(match.phone1),
     supervisorDescription: trim(match.supervisorDescription),
@@ -448,15 +365,15 @@ async function handleShifts(req, env) {
     return json({ success: false, message: "employeeNumber is required." }, { status: 400 });
   }
 
-  // Always ask WinTeam for a 15-day window, based on "central" now
-  const startBase = nowCentral();                 // tenant home tz anchor (tweak if needed)
-  const fromDate = ymd(startBase);                // YYYY-MM-DD (today)
-  const toDate   = ymd(addDaysUTC(startBase, 15)); // +15 days
+  // Always ask WinTeam for a 15-day window
+  const startBase = nowAnchor();
+  const fromDate = ymd(startBase);
+  const toDate   = ymd(addDaysUTC(startBase, 15));
 
   const url = new URL(SHIFTS_BASE_EXACT);
   url.searchParams.set("employeeNumber", employeeNumber);
-  url.searchParams.set("fromDate", fromDate);   
-  url.searchParams.set("toDate", toDate);       
+  url.searchParams.set("fromDate", fromDate);
+  url.searchParams.set("toDate", toDate);
 
   const wt = await callWinTeamJSON(url.toString(), env);
   if (!wt.ok) {
@@ -596,56 +513,33 @@ function buildMondayColumnsFromFriendly(body) {
     }
   };
 
-  // plain text/status-like fields (we only set if provided)
-  // 5) DIVISION (status column)
-  // Priority: explicit "division" in body → supervisorDescription-derived state → ofcWorkstate/workState/state
-  const explicitDivision = String(body.division || "").trim();
-
-  let derivedDivision = "";
-  if (!explicitDivision) {
-    // try supervisorDescription like "IL Ops Team"
-    derivedDivision = stateFromSupervisor(body.supervisorDescription);
-    if (!derivedDivision) {
-      // fall back to state-like fields (convert code to full name if necessary)
-      const rawState = String(body.ofcWorkstate || body.workState || body.state || "").trim();
-      if (rawState.length === 2 && STATE_FULL[rawState.toUpperCase()]) {
-        derivedDivision = STATE_FULL[rawState.toUpperCase()];
-      } else if (rawState) {
-        derivedDivision = rawState; // already a full name
-      }
-    }
-  }
-
-  const finalDivision = explicitDivision || derivedDivision;
-  if (finalDivision) {
-    out[MONDAY_COLUMN_MAP.division] = mondayStatusLabel(finalDivision);
-  }
-  addIf("department");
+  // 1) Plain text-ish fields
   addIf("site");
   addIf("reason");
   addIf("timeInOut");
   addIf("startTime");
   addIf("endTime");
   addIf("deptEmail");
-  addIf("emailStatus");
   addIf("zoomGuid");
   addIf("shift");
+  // If you want emailStatus as a Status too, convert via mondayStatusLabel:
+  // addIf("emailStatus", (v) => mondayStatusLabel(v));
+
   if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
 
-  // ✅ EMAIL column requires an object: { email, text }
+  // 2) EMAIL → { email, text }
   addIf("email", (v) => {
     const email = String(v).trim();
     if (!email || !/@/.test(email)) return undefined;
     return { email, text: email };
   });
 
-  // ✅ PHONE columns require an object: { phone, countryShortName }
-  // If you only have a US number, "US" is fine. Strip spaces/formatting.
+  // 3) PHONE / CALLER ID → { phone, countryShortName }
   const normPhone = (raw) => String(raw).replace(/[^\d+]/g, "").trim();
   addIf("phone",   (v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
   addIf("callerId",(v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
 
-  // ✅ DATE/TIME column can accept either a prebuilt object or an ISO-like string
+  // 4) DATE/TIME value normalization
   if (body.dateTime) {
     const v = body.dateTime;
     if (typeof v === "object" && (v.date || v.time)) {
@@ -662,36 +556,65 @@ function buildMondayColumnsFromFriendly(body) {
     }
   }
 
-  // Remove any undefined values (failed validations)
+  // 5) DIVISION (Status) — priority: explicit → supervisorDescription → ofcWorkstate/state
+  const explicitDivision = String(body.division || "").trim();
+
+  let derivedDivision = "";
+  if (!explicitDivision) {
+    derivedDivision = stateFromSupervisor(body.supervisorDescription);
+    if (!derivedDivision) {
+      const rawState = String(body.ofcWorkstate || body.workState || body.state || "").trim();
+      if (rawState.length === 2 && STATE_FULL[rawState.toUpperCase()]) {
+        derivedDivision = STATE_FULL[rawState.toUpperCase()];
+      } else if (rawState) {
+        derivedDivision = rawState; // already full name
+      }
+    }
+  }
+  const finalDivision = explicitDivision || derivedDivision;
+  if (finalDivision) {
+    out[MONDAY_COLUMN_MAP.division] = mondayStatusLabel(finalDivision);
+  }
+
+  // 6) DEPARTMENT (Status) — priority: explicit → derived from reason
+  const explicitDept = String(body.department || "").trim();
+  const dept = explicitDept || deriveDepartmentFromReason(body.reason || "");
+  if (dept) {
+    out[MONDAY_COLUMN_MAP.department] = mondayStatusLabel(dept);
+  }
+
+  // Remove undefined
   for (const k of Object.keys(out)) { if (out[k] === undefined) delete out[k]; }
   return out;
 }
-
 
 async function handleMondayWrite(req, env) {
   const body = await readJson(req);
   if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
 
-// BEFORE
-// const boardId = Number(body.boardId || env.MONDAY_DEFAULT_BOARD_ID);
+  // Accept explicit boardId in body, or env vars (strings for ID!)
+  const boardId = String(
+    body.boardId ||
+    env.MONDAY_BOARD_ID ||
+    env.MONDAY_DEFAULT_BOARD_ID ||
+    ""
+  ).trim();
+  if (!boardId) {
+    return json({ success:false, message:"boardId is required (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID, or pass boardId in the body)." }, { status: 400 });
+  }
 
-// AFTER
-const boardId = String(env.MONDAY_BOARD_ID).trim();
-if (!boardId) {
-  return json({ success:false, message:"boardId is required (set MONDAY_DEFAULT_BOARD_ID or pass boardId)." }, { status: 400 });
-}
   const itemName = trim(body.itemName || body.name || "");
   const groupId = trim(body.groupId || "");
   const dedupeKey = trim(body.dedupeKey || body.engagementId || "");
 
-  if (!boardId || !itemName) {
-    return json({ success: false, message: "boardId and itemName are required." }, { status: 400 });
+  if (!itemName) {
+    return json({ success: false, message: "itemName is required." }, { status: 400 });
   }
 
-  const fromFriendly = buildMondayColumnsFromFriendly(body);
-  let explicit = body.columnValues && typeof body.columnValues === "object" ? body.columnValues : {};
-  const columnValues = { ...fromFriendly, ...explicit };
+  // Build columns (auto-derive Division/Department/email/phone formats)
+  const columnValues = buildMondayColumnsFromFriendly(body);
 
+  // Idempotency guard (optional)
   if (dedupeKey && (await flowGuardSeen(env, dedupeKey))) {
     return json({
       success: true,
@@ -703,28 +626,17 @@ if (!boardId) {
     });
   }
 
-  // const createMutation = `
-  //   mutation ($boardId: Int!, $itemName: String!, $groupId: String) {
-  //     create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
-  //       id
-  //       name
-  //       board { id }
-  //       group { id }
-  //     }
-  //   }
-  // `;
-
+  // Create item (IDs as strings / GraphQL ID!)
   const createMutation = `
-  mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
-    create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
-      id
-      name
-      board { id }
-      group { id }
+    mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
+      create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
+        id
+        name
+        board { id }
+        group { id }
+      }
     }
-  }
-`;
-  
+  `;
   let created;
   try {
     const res = await mondayGraphQL(env, createMutation, {
@@ -737,6 +649,7 @@ if (!boardId) {
     return json({ success: false, message: "Monday create_item failed.", detail: String(e) }, { status: 502 });
   }
 
+  // Update columns (JSON string required by Monday)
   if (Object.keys(columnValues).length) {
     const changeMutation = `
       mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
@@ -750,7 +663,7 @@ if (!boardId) {
     try {
       await mondayGraphQL(env, changeMutation, {
         boardId,
-        itemId: Number(created.id),
+        itemId: String(created.id),
         cv: cvString
       });
     } catch (e) {
@@ -782,6 +695,7 @@ async function handleEnvDebug(req, env) {
       WINTEAM_TENANT_ID: present("WINTEAM_TENANT_ID"),
       WINTEAM_API_KEY: present("WINTEAM_API_KEY"),
       MONDAY_API_KEY: present("MONDAY_API_KEY"),
+      MONDAY_BOARD_ID: present("MONDAY_BOARD_ID"),
       MONDAY_DEFAULT_BOARD_ID: present("MONDAY_DEFAULT_BOARD_ID"),
       FLOW_GUARD: !!env.FLOW_GUARD
     }
