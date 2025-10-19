@@ -73,6 +73,130 @@ function addDaysUTC(date, days) {
   return d;
 }
 
+// ------------------- logging utils -------------------
+const MAX_LOG_BODY = 2048; // bytes to show from bodies
+
+function pick(obj, keys) {
+  const out = {};
+  for (const k of keys) if (k in obj) out[k] = obj[k];
+  return out;
+}
+
+function headerObj(headers) {
+  // Convert Headers to a plain object; only keep a safe subset by default
+  const safeKeys = [
+    "content-type",
+    "user-agent",
+    "cf-ray",
+    "x-forwarded-for",
+    "x-real-ip",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "host",
+    "origin",
+    "referer"
+  ];
+  const out = {};
+  for (const [k, v] of headers.entries()) {
+    // Never log secrets
+    if (/authorization|api|key|token|cookie|set-cookie|ocp-apim-subscription-key/i.test(k)) continue;
+    if (safeKeys.includes(k.toLowerCase())) out[k] = v;
+  }
+  return out;
+}
+
+// Very conservative masking of potential PII (phone, email, SSN last4)
+function maskPII(str) {
+  if (!str) return str;
+  let s = String(str);
+
+  // emails: keep local first char + domain TLD
+  s = s.replace(/([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g, "$1***@$2");
+
+  // phone numbers: keep last 2
+  s = s.replace(/\+?\d[\d\s().-]{6,}\d/g, (m) => m.slice(0, Math.max(0, m.length - 2)).replace(/\d/g, "x") + m.slice(-2));
+
+  // explicit "ssnLast4" JSON fields
+  s = s.replace(/("ssnLast4"\s*:\s*")(\d{0,4})(")/gi, (_, a, b, c) => a + (b ? "***" + b.slice(-1) : "***") + c);
+
+  return s;
+}
+
+async function cloneBodyPreview(reqOrResp) {
+  try {
+    // Try JSON first
+    const ct = reqOrResp.headers?.get?.("content-type") || "";
+    if (/json/i.test(ct)) {
+      const text = JSON.stringify(await reqOrResp.clone().json());
+      return maskPII(text).slice(0, MAX_LOG_BODY);
+    }
+  } catch (_) {}
+  try {
+    const text = await reqOrResp.clone().text();
+    return maskPII(text).slice(0, MAX_LOG_BODY);
+  } catch {
+    return "";
+  }
+}
+
+function shouldLog(req, env) {
+  if (typeof env?.DEBUG_LOG === "string") {
+    if (env.DEBUG_LOG.toLowerCase() === "false") return false;
+    if (env.DEBUG_LOG.toLowerCase() === "true") return true;
+  }
+  const url = new URL(req.url);
+  return url.searchParams.get("debug") === "1" || true; // default: log
+}
+
+// Higher-order wrapper to log request/response around a handler
+function withLogging(handler) {
+  return async (req, env, ctx) => {
+    const start = Date.now();
+    const url = new URL(req.url);
+    const doLog = shouldLog(req, env);
+
+    // Pre-capture request preview
+    const reqPreview = doLog ? await cloneBodyPreview(req) : "";
+    let res, resPreview = "", error = null;
+
+    try {
+      res = await handler(req, env, ctx);
+    } catch (e) {
+      error = e;
+      // Ensure we still return a JSON error
+      res = new Response(JSON.stringify({
+        success: false,
+        message: "Unhandled error.",
+        detail: String(e && e.message || e)
+      }, null, 2), { status: 500, headers: { "content-type": "application/json" } });
+    }
+
+    const ms = Date.now() - start;
+
+    if (doLog) {
+      try { resPreview = await cloneBodyPreview(res); } catch {}
+      const logBlock = {
+        at: new Date().toISOString(),
+        ray: req.headers.get("cf-ray") || undefined,
+        method: req.method,
+        path: url.pathname,
+        query: Object.fromEntries(url.searchParams.entries()),
+        headers: headerObj(req.headers),
+        reqBody: reqPreview,
+        status: res.status,
+        resHeaders: headerObj(res.headers || new Headers()),
+        resBody: resPreview,
+        ms
+      };
+      if (error) logBlock.error = String(error && error.message || error);
+      console.log("HTTP", JSON.stringify(logBlock));
+    }
+
+    return res;
+  };
+}
+
 // Normalize US phone to +E.164 when possible
 function normalizeUsPhone(raw) {
   if (!raw) return "";
@@ -491,7 +615,7 @@ async function handleMondayWrite(req, env) {
 
 // ------------------- Router -------------------
 export default {
-  async fetch(req, env) {
+  fetch: withLogging(async (req, env, ctx) => {
     const { method } = req;
     const url = new URL(req.url);
     const path = url.pathname;
@@ -521,5 +645,5 @@ export default {
     } catch (e) {
       return json({ success: false, message: "Unhandled error.", detail: String(e) }, { status: 500 });
     }
-  },
+  })
 };
