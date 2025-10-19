@@ -519,7 +519,7 @@ async function handleMondayWrite(req, env) {
 // const boardId = Number(body.boardId || env.MONDAY_DEFAULT_BOARD_ID);
 
 // AFTER
-const boardId = String(body.boardId || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
+const boardId = String(env.MONDAY_BOARD_ID).trim();
 if (!boardId) {
   return json({ success:false, message:"boardId is required (set MONDAY_DEFAULT_BOARD_ID or pass boardId)." }, { status: 400 });
 }
