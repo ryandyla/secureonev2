@@ -254,6 +254,18 @@ function buildEmployeeURL(employeeNumber) {
 }
 
 // ------------------- Time formatting helpers -------------------
+// Helper: parse "YYYY-MM-DDTHH:mm:ss" as a *local wall time* Date in UTC frame
+function parseNaiveAsLocalWall(isoNoTZ) {
+  // isoNoTZ like "2025-10-18T23:00:00"
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(isoNoTZ));
+  if (!m) return null;
+  const [ , Y, M, D, h, min, s ] = m;
+  return new Date(Date.UTC(
+    Number(Y), Number(M)-1, Number(D),
+    Number(h), Number(min), Number(s || 0)
+  ));
+}
+
 function parseNoTZToUTC(dateStr) {
   // "YYYY-MM-DDTHH:mm:ss" w/out TZ → treated as UTC on Workers
   const t = Date.parse(dateStr);
@@ -388,42 +400,58 @@ async function handleShifts(req, env) {
       if (!startUTC || !endUTC) continue;
 
       // Convert to "local wall-clock" frame using utCoffset: local = UTC + offsetHours
-      const startLocal = addHours(startUTC, utcOffset);
-      let endLocal = addHours(endUTC, utcOffset);
+      const startLocal = parseNaiveAsLocalWall(s.startTime);
+let   endLocal   = parseNaiveAsLocalWall(s.endTime);
+if (!startLocal || !endLocal) continue;
 
-      // Overnight support
-      if (endLocal.getTime() <= startLocal.getTime()) endLocal = addHours(endLocal, 24);
+// Overnight support: if end <= start, push end +24h (still in local wall frame)
+if (endLocal.getTime() <= startLocal.getTime()) {
+  endLocal = new Date(endLocal.getTime() + 24*60*60*1000);
+}
 
-      const date1 = weekdayMonthDay(startLocal);
-      const date2 = weekdayMonthDay(endLocal);
-      const time1 = fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes());
-      const time2 = fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes());
+// For human text
+const date1 = weekdayMonthDay(startLocal);
+const date2 = weekdayMonthDay(endLocal);
+const time1 = fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes());
+const time2 = fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes());
 
-      const concise =
-        `${ymdFromDate(startLocal)} ${pad2(startLocal.getUTCHours())}:${pad2(startLocal.getUTCMinutes())}` +
-        ` → ${pad2(endLocal.getUTCHours())}:${pad2(endLocal.getUTCMinutes())}` +
-        (site ? ` @ ${site}` : "") + (role ? ` (${role})` : "");
+// Concise (local wall clock)
+const concise =
+  `${ymdFromDate(startLocal)} ${pad2(startLocal.getUTCHours())}:${pad2(startLocal.getUTCMinutes())}` +
+  ` → ${pad2(endLocal.getUTCHours())}:${pad2(endLocal.getUTCMinutes())}` +
+  (site ? ` @ ${site}` : "") + (role ? ` (${role})` : "");
 
-      const speakLine =
-        `${date1}, ${time1} to ${date2}${date2 !== date1 ? "" : ""} ${time2}` +
-        (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
+// Speakable (local wall clock)
+const speakLine =
+  `${date1}, ${time1} to ${date2}${date2 !== date1 ? "" : ""} ${time2}` +
+  (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
 
-      rows.push({
-        employeeNumber: trim(r.employeeNumber || employeeNumber),
-        site,
-        role,
-        utcOffset,
-        hours: s.hours,
-        hourType: trim(s.hourType),
-        hourDescription: trim(s.hourDescription),
-        scheduleDetailID: s.scheduleDetailID,
-        startLocalISO: startLocal.toISOString(),
-        endLocalISO: endLocal.toISOString(),
-        speakLine,
-        concise,
-      });
-    }
-  }
+// If you still want the *real* UTC instants (not needed for filtering), you can compute:
+const utcInstantStart = new Date(startLocal.getTime() - utcOffset*60*60*1000);
+const utcInstantEnd   = new Date(endLocal.getTime()   - utcOffset*60*60*1000);
+
+rows.push({
+  employeeNumber: trim(r.employeeNumber || employeeNumber),
+  site,
+  role,
+  utcOffset,
+  hours: s.hours,
+  hourType: trim(s.hourType),
+  hourDescription: trim(s.hourDescription),
+  scheduleDetailID: s.scheduleDetailID,
+
+  // Local wall-clock ISO (we compare/filter in this frame)
+  startLocalISO: startLocal.toISOString(),
+  endLocalISO: endLocal.toISOString(),
+
+  // Optional: true UTC instants if you ever need them later
+  // startUTCISO: utcInstantStart.toISOString(),
+  // endUTCISO:   utcInstantEnd.toISOString(),
+
+  speakLine,
+  concise,
+});
+
 
   // ---------- ALWAYS apply local “now → now+15d” window (per row) ----------
   const nowUTC = new Date();
