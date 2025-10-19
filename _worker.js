@@ -1,60 +1,62 @@
-// Cloudflare Worker: ZVA <-> WinTeam / Monday bridge (Option A + Monday column mapping)
+// Cloudflare Worker: ZVA <-> WinTeam / Monday bridge
 //
 // Endpoints:
-//  - POST /auth/employee   : verify employeeNumber + ssnLast4; return select fields
-//  - POST /winteam/shifts  : get shifts via shiftDetails; return speakable + entries + mondayShiftText
-//  - POST /monday/write    : create Monday item + set columns; optional idempotency via KV (FLOW_GUARD)
+//  - POST /auth/employee
+//  - POST /winteam/shifts
+//  - POST /monday/write
+//  - GET  /debug/env           (optional: shows which bindings exist; no values)
 //
 // Required secrets: WINTEAM_TENANT_ID, WINTEAM_API_KEY, MONDAY_API_KEY
 // Optional secrets: MONDAY_DEFAULT_BOARD_ID, FLOW_GUARD_TTL_SECONDS
 // Optional KV binding: FLOW_GUARD
 //
-// Deploy URL example: https://secureonev2.rdyla.workers.dev
+// wrangler.toml (example):
+// name = "secureonev2"
+// main = "_worker.js"
+// compatibility_date = "2025-10-18"
 
-// ------------------- WinTeam endpoints -------------------
-const EMPLOYEE_BASE =
-  "http://apim.myteamsoftware.com/wtnextgen/employees/v1/api/employees";
-const SHIFTS_BASE_EXACT =
-  "http://apim.myteamsoftware.com/wtnextgen/schedules/v1/api/shiftDetails";
+///////////////////////////////
+// Constants
+///////////////////////////////
 
-// ------------------- Monday.com endpoint -------------------
+const EMPLOYEE_BASE = "http://apim.myteamsoftware.com/wtnextgen/employees/v1/api/employees";
+const SHIFTS_BASE_EXACT = "http://apim.myteamsoftware.com/wtnextgen/schedules/v1/api/shiftDetails";
 const MONDAY_API_URL = "https://api.monday.com/v2";
 
-// ------------------- Monday column map (friendly → columnId) -------------------
 const MONDAY_COLUMN_MAP = {
-  // name column is set via itemName, not column values
-  division: "color_mktd81zp",           // "Division:"
-  department: "color_mktsk31h",         // "Department"
-  site: "text_mktj4gmt",                // "Account/Site:"
-  email: "email_mktdyt3z",              // "Email Address:"
-  phone: "phone_mktdphra",              // "Phone Number:"
-  callerId: "phone_mkv0p9q3",           // "Caller ID:"
-  reason: "text_mktdb8pg",              // "Call Issue/Reason:"
-  timeInOut: "text_mktsvsns",           // "Time In/Out:"
-  startTime: "text_mkv0t29z",           // "Start Time (if applicable):"
-  endTime: "text_mkv0nmq1",             // "End Time (if applicable)"
-  dateTime: "date4",                    // "Date/Time:" (Monday date column)
-  deptEmail: "text_mkv07gad",           // "Department Email:"
-  emailStatus: "color_mkv0cpxc",        // "Email Status:"
-  itemIdEcho: "pulse_id_mkv6rhgy",      // (usually auto; rarely set)
-  zoomGuid: "text_mkv7j2fq",            // "Zoom Call GUID"
-  shift: "text_mkwn6bzw",               // "Shift"
+  division: "color_mktd81zp",     // "Division:"
+  department: "color_mktsk31h",   // "Department"
+  site: "text_mktj4gmt",          // "Account/Site:"
+  email: "email_mktdyt3z",        // "Email Address:"
+  phone: "phone_mktdphra",        // "Phone Number:"
+  callerId: "phone_mkv0p9q3",     // "Caller ID:"
+  reason: "text_mktdb8pg",        // "Call Issue/Reason:"
+  timeInOut: "text_mktsvsns",     // "Time In/Out:"
+  startTime: "text_mkv0t29z",     // "Start Time (if applicable):"
+  endTime: "text_mkv0nmq1",       // "End Time (if applicable)"
+  dateTime: "date4",              // "Date/Time:"
+  deptEmail: "text_mkv07gad",     // "Department Email:"
+  emailStatus: "color_mkv0cpxc",  // "Email Status:"
+  itemIdEcho: "pulse_id_mkv6rhgy",
+  zoomGuid: "text_mkv7j2fq",
+  shift: "text_mkwn6bzw"
 };
 
-// ------------------- tiny utils -------------------
+///////////////////////////////
+// Tiny utils
+///////////////////////////////
+
 const json = (obj, { status = 200, cors = true } = {}) =>
   new Response(JSON.stringify(obj, null, 2), {
     status,
     headers: {
       "content-type": "application/json; charset=utf-8",
-      ...(cors
-        ? {
-            "access-control-allow-origin": "*",
-            "access-control-allow-headers": "content-type, authorization",
-            "access-control-allow-methods": "GET,POST,OPTIONS",
-          }
-        : {}),
-    },
+      ...(cors ? {
+        "access-control-allow-origin": "*",
+        "access-control-allow-headers": "content-type, authorization",
+        "access-control-allow-methods": "GET,POST,OPTIONS"
+      } : {})
+    }
   });
 
 const toStr = (v) => (v == null ? "" : String(v));
@@ -72,132 +74,6 @@ function addDaysUTC(date, days) {
   d.setUTCDate(d.getUTCDate() + days);
   return d;
 }
-
-// ------------------- logging utils -------------------
-const MAX_LOG_BODY = 2048; // bytes to show from bodies
-
-function pick(obj, keys) {
-  const out = {};
-  for (const k of keys) if (k in obj) out[k] = obj[k];
-  return out;
-}
-
-function headerObj(headers) {
-  // Convert Headers to a plain object; only keep a safe subset by default
-  const safeKeys = [
-    "content-type",
-    "user-agent",
-    "cf-ray",
-    "x-forwarded-for",
-    "x-real-ip",
-    "accept",
-    "accept-encoding",
-    "accept-language",
-    "host",
-    "origin",
-    "referer"
-  ];
-  const out = {};
-  for (const [k, v] of headers.entries()) {
-    // Never log secrets
-    if (/authorization|api|key|token|cookie|set-cookie|ocp-apim-subscription-key/i.test(k)) continue;
-    if (safeKeys.includes(k.toLowerCase())) out[k] = v;
-  }
-  return out;
-}
-
-// Very conservative masking of potential PII (phone, email, SSN last4)
-function maskPII(str) {
-  if (!str) return str;
-  let s = String(str);
-
-  // emails: keep local first char + domain TLD
-  s = s.replace(/([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g, "$1***@$2");
-
-  // phone numbers: keep last 2
-  s = s.replace(/\+?\d[\d\s().-]{6,}\d/g, (m) => m.slice(0, Math.max(0, m.length - 2)).replace(/\d/g, "x") + m.slice(-2));
-
-  // explicit "ssnLast4" JSON fields
-  s = s.replace(/("ssnLast4"\s*:\s*")(\d{0,4})(")/gi, (_, a, b, c) => a + (b ? "***" + b.slice(-1) : "***") + c);
-
-  return s;
-}
-
-async function cloneBodyPreview(reqOrResp) {
-  try {
-    // Try JSON first
-    const ct = reqOrResp.headers?.get?.("content-type") || "";
-    if (/json/i.test(ct)) {
-      const text = JSON.stringify(await reqOrResp.clone().json());
-      return maskPII(text).slice(0, MAX_LOG_BODY);
-    }
-  } catch (_) {}
-  try {
-    const text = await reqOrResp.clone().text();
-    return maskPII(text).slice(0, MAX_LOG_BODY);
-  } catch {
-    return "";
-  }
-}
-
-function shouldLog(req, env) {
-  if (typeof env?.DEBUG_LOG === "string") {
-    if (env.DEBUG_LOG.toLowerCase() === "false") return false;
-    if (env.DEBUG_LOG.toLowerCase() === "true") return true;
-  }
-  const url = new URL(req.url);
-  return url.searchParams.get("debug") === "1" || true; // default: log
-}
-
-// Higher-order wrapper to log request/response around a handler
-function withLogging(handler) {
-  return async (req, env, ctx) => {
-    const start = Date.now();
-    const url = new URL(req.url);
-    const doLog = shouldLog(req, env);
-
-    // Pre-capture request preview
-    const reqPreview = doLog ? await cloneBodyPreview(req) : "";
-    let res, resPreview = "", error = null;
-
-    try {
-      res = await handler(req, env, ctx);
-    } catch (e) {
-      error = e;
-      // Ensure we still return a JSON error
-      res = new Response(JSON.stringify({
-        success: false,
-        message: "Unhandled error.",
-        detail: String(e && e.message || e)
-      }, null, 2), { status: 500, headers: { "content-type": "application/json" } });
-    }
-
-    const ms = Date.now() - start;
-
-    if (doLog) {
-      try { resPreview = await cloneBodyPreview(res); } catch {}
-      const logBlock = {
-        at: new Date().toISOString(),
-        ray: req.headers.get("cf-ray") || undefined,
-        method: req.method,
-        path: url.pathname,
-        query: Object.fromEntries(url.searchParams.entries()),
-        headers: headerObj(req.headers),
-        reqBody: reqPreview,
-        status: res.status,
-        resHeaders: headerObj(res.headers || new Headers()),
-        resBody: resPreview,
-        ms
-      };
-      if (error) logBlock.error = String(error && error.message || error);
-      console.log("HTTP", JSON.stringify(logBlock));
-    }
-
-    return res;
-  };
-}
-
-// Normalize US phone to +E.164 when possible
 function normalizeUsPhone(raw) {
   if (!raw) return "";
   const s = String(raw);
@@ -207,22 +83,118 @@ function normalizeUsPhone(raw) {
   if (/^\+\d{8,15}$/.test(s.trim())) return s.trim();
   return s.trim();
 }
+function fmt12h(h, m) {
+  let hour = h % 12;
+  if (hour === 0) hour = 12;
+  const ampm = h < 12 ? "AM" : "PM";
+  return `${hour}:${pad2(m)} ${ampm}`;
+}
+function weekdayMonthDay(d) {
+  const wk = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][d.getUTCDay()];
+  const mo = ["January","February","March","April","May","June","July","August","September","October","November","December"][d.getUTCMonth()];
+  return `${wk}, ${mo} ${d.getUTCDate()}`;
+}
+function ymdFromDate(d) {
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+///////////////////////////////
+// Logging (PII-safe)
+///////////////////////////////
+
+const MAX_LOG_BODY = 2048;
+
+function headerObj(headers) {
+  const safeKeys = [
+    "content-type","user-agent","cf-ray","x-forwarded-for","x-real-ip",
+    "accept","accept-encoding","accept-language","host","origin","referer"
+  ];
+  const out = {};
+  for (const [k, v] of headers.entries()) {
+    if (/authorization|api|key|token|cookie|set-cookie|ocp-apim-subscription-key/i.test(k)) continue;
+    if (safeKeys.includes(k.toLowerCase())) out[k] = v;
+  }
+  return out;
+}
+function maskPII(str) {
+  if (!str) return str;
+  let s = String(str);
+  s = s.replace(/([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/g, "$1***@$2");
+  s = s.replace(/\+?\d[\d\s().-]{6,}\d/g, (m) => m.slice(0, Math.max(0, m.length - 2)).replace(/\d/g, "x") + m.slice(-2));
+  s = s.replace(/("ssnLast4"\s*:\s*")(\d{0,4})(")/gi, (_, a, b, c) => a + (b ? "***" + b.slice(-1) : "***") + c);
+  return s;
+}
+async function cloneBodyPreview(reqOrResp) {
+  try {
+    const ct = reqOrResp.headers?.get?.("content-type") || "";
+    if (/json/i.test(ct)) {
+      const text = JSON.stringify(await reqOrResp.clone().json());
+      return maskPII(text).slice(0, MAX_LOG_BODY);
+    }
+  } catch {}
+  try {
+    const text = await reqOrResp.clone().text();
+    return maskPII(text).slice(0, MAX_LOG_BODY);
+  } catch { return ""; }
+}
+function withLogging(handler) {
+  return async (req, env, ctx) => {
+    const start = Date.now();
+    const url = new URL(req.url);
+    const reqPreview = await cloneBodyPreview(req);
+    let res;
+    try {
+      res = await handler(req, env, ctx);
+    } catch (e) {
+      res = json({ success:false, message:"Unhandled error.", detail:String(e && e.message || e) }, { status: 500 });
+    }
+    const resPreview = await cloneBodyPreview(res);
+    const ms = Date.now() - start;
+    console.log("HTTP", JSON.stringify({
+      at: new Date().toISOString(),
+      ray: req.headers.get("cf-ray") || undefined,
+      method: req.method,
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams.entries()),
+      headers: headerObj(req.headers),
+      reqBody: reqPreview,
+      status: res.status,
+      resHeaders: headerObj(res.headers || new Headers()),
+      resBody: resPreview,
+      ms
+    }));
+    return res;
+  };
+}
+
+///////////////////////////////
+// HTTP helpers
+///////////////////////////////
 
 async function readJson(req) {
   try {
-    return await req.json();
-  } catch {
-    return null;
-  }
+    const j = await req.json();
+    if (j && typeof j === "object" && typeof j.body === "string") {
+      try { return JSON.parse(j.body); } catch { return j; }
+    }
+    return j;
+  } catch {}
+  try {
+    const t = await req.text();
+    if (!t) return null;
+    const j = JSON.parse(t);
+    if (j && typeof j === "object" && typeof j.body === "string") {
+      try { return JSON.parse(j.body); } catch { return j; }
+    }
+    return j;
+  } catch { return null; }
 }
 
-// ------------------- WinTeam helpers -------------------
 function buildWTHeaders(TENANT_ID, API_KEY) {
-  // EXACT header names per your APIM gateway
   return {
     tenantId: TENANT_ID,
     "Ocp-Apim-Subscription-Key": API_KEY,
-    accept: "application/json",
+    accept: "application/json"
   };
 }
 
@@ -253,59 +225,19 @@ function buildEmployeeURL(employeeNumber) {
   return url.toString();
 }
 
-// ------------------- Time formatting helpers -------------------
-// Helper: parse "YYYY-MM-DDTHH:mm:ss" as a *local wall time* Date in UTC frame
-function parseNaiveAsLocalWall(isoNoTZ) {
-  // isoNoTZ like "2025-10-18T23:00:00"
-  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(isoNoTZ));
-  if (!m) return null;
-  const [ , Y, M, D, h, min, s ] = m;
-  return new Date(Date.UTC(
-    Number(Y), Number(M)-1, Number(D),
-    Number(h), Number(min), Number(s || 0)
-  ));
-}
-
-function parseNoTZToUTC(dateStr) {
-  // "YYYY-MM-DDTHH:mm:ss" w/out TZ → treated as UTC on Workers
-  const t = Date.parse(dateStr);
-  return isNaN(t) ? null : new Date(t);
-}
-function addHours(d, hours) {
-  const nd = new Date(d.getTime());
-  nd.setUTCHours(nd.getUTCHours() + hours);
-  return nd;
-}
-function fmt12h(h, m) {
-  let hour = h % 12;
-  if (hour === 0) hour = 12;
-  const ampm = h < 12 ? "AM" : "PM";
-  return `${hour}:${pad2(m)} ${ampm}`;
-}
-function weekdayMonthDay(d) {
-  const wk = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"][d.getUTCDay()];
-  const mo = ["January","February","March","April","May","June","July","August","September","October","November","December"][d.getUTCMonth()];
-  return `${wk}, ${mo} ${d.getUTCDate()}`;
-}
-function ymdFromDate(d) { return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`; }
-
-// ------------------- Monday helpers -------------------
 async function mondayGraphQL(env, query, variables) {
   const token = env.MONDAY_API_KEY;
   if (!token) throw new Error("MONDAY_API_KEY not configured.");
   const r = await fetch(MONDAY_API_URL, {
     method: "POST",
     headers: { Authorization: token, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
+    body: JSON.stringify({ query, variables })
   });
   const j = await r.json();
-  if (!r.ok || j.errors) {
-    throw new Error(`Monday API error: ${r.status} ${JSON.stringify(j.errors || j)}`);
-  }
+  if (!r.ok || j.errors) throw new Error(`Monday API error: ${r.status} ${JSON.stringify(j.errors || j)}`);
   return j.data;
 }
 
-// Optional idempotency guard w/ KV
 async function flowGuardSeen(env, key) {
   if (!key || !env.FLOW_GUARD) return false;
   const existing = await env.FLOW_GUARD.get(key);
@@ -317,7 +249,26 @@ async function flowGuardMark(env, key) {
   await env.FLOW_GUARD.put(key, "1", { expirationTtl: ttl });
 }
 
-// ------------------- Handlers -------------------
+///////////////////////////////
+// Time parsing for shifts
+///////////////////////////////
+
+// Parse "YYYY-MM-DDTHH:mm:ss" (no TZ) as a *local wall-clock* Date in UTC frame.
+// This avoids treating the naive string as real UTC and keeps comparisons consistent.
+function parseNaiveAsLocalWall(isoNoTZ) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(isoNoTZ));
+  if (!m) return null;
+  const [ , Y, M, D, h, min, s ] = m;
+  return new Date(Date.UTC(
+    Number(Y), Number(M) - 1, Number(D),
+    Number(h), Number(min), Number(s || 0)
+  ));
+}
+
+///////////////////////////////
+// Handlers
+///////////////////////////////
+
 async function handleAuthEmployee(req, env) {
   const body = await readJson(req);
   if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
@@ -353,7 +304,7 @@ async function handleAuthEmployee(req, env) {
     employeeNumber: match.employeeNumber,
     employeeId: match.employeeId,
     statusDescription: trim(match.statusDescription),
-    typeDescription: trim(match.typeDescription),
+    typeDescription: trim(match.typeDescription)
   };
 
   return json({ success: true, message: "Successful employee lookup.", employee: payload });
@@ -364,14 +315,11 @@ async function handleShifts(req, env) {
   if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
 
   const employeeNumber = trim(body.employeeNumber);
-  // optional server-side pagination (default 0)
   const pageStart = Number(trim(body.pageStart ?? "0")) || 0;
-
   if (!employeeNumber) {
     return json({ success: false, message: "employeeNumber is required." }, { status: 400 });
   }
 
-  // Exact endpoint + param
   const url = new URL(SHIFTS_BASE_EXACT);
   url.searchParams.set("employeeNumber", employeeNumber);
 
@@ -383,7 +331,6 @@ async function handleShifts(req, env) {
     );
   }
 
-  // data[0].results[*] => { jobDescription, postDescription, utCoffset, shifts:[...] }
   const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
   const results = Array.isArray(page?.results) ? page.results : [];
 
@@ -395,65 +342,48 @@ async function handleShifts(req, env) {
     const list = Array.isArray(r.shifts) ? r.shifts : [];
 
     for (const s of list) {
-      const startUTC = parseNoTZToUTC(s.startTime);
-      let endUTC = parseNoTZToUTC(s.endTime);
-      if (!startUTC || !endUTC) continue;
-
-      // Convert to "local wall-clock" frame using utCoffset: local = UTC + offsetHours
       const startLocal = parseNaiveAsLocalWall(s.startTime);
-let   endLocal   = parseNaiveAsLocalWall(s.endTime);
-if (!startLocal || !endLocal) continue;
+      let endLocal = parseNaiveAsLocalWall(s.endTime);
+      if (!startLocal || !endLocal) continue;
 
-// Overnight support: if end <= start, push end +24h (still in local wall frame)
-if (endLocal.getTime() <= startLocal.getTime()) {
-  endLocal = new Date(endLocal.getTime() + 24*60*60*1000);
-}
+      // Overnight support
+      if (endLocal.getTime() <= startLocal.getTime()) {
+        endLocal = new Date(endLocal.getTime() + 24 * 60 * 60 * 1000);
+      }
 
-// For human text
-const date1 = weekdayMonthDay(startLocal);
-const date2 = weekdayMonthDay(endLocal);
-const time1 = fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes());
-const time2 = fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes());
+      const date1 = weekdayMonthDay(startLocal);
+      const date2 = weekdayMonthDay(endLocal);
+      const time1 = fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes());
+      const time2 = fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes());
 
-// Concise (local wall clock)
-const concise =
-  `${ymdFromDate(startLocal)} ${pad2(startLocal.getUTCHours())}:${pad2(startLocal.getUTCMinutes())}` +
-  ` → ${pad2(endLocal.getUTCHours())}:${pad2(endLocal.getUTCMinutes())}` +
-  (site ? ` @ ${site}` : "") + (role ? ` (${role})` : "");
+      const concise =
+        `${ymdFromDate(startLocal)} ${pad2(startLocal.getUTCHours())}:${pad2(startLocal.getUTCMinutes())}` +
+        ` → ${pad2(endLocal.getUTCHours())}:${pad2(endLocal.getUTCMinutes())}` +
+        (site ? ` @ ${site}` : "") + (role ? ` (${role})` : "");
 
-// Speakable (local wall clock)
-const speakLine =
-  `${date1}, ${time1} to ${date2}${date2 !== date1 ? "" : ""} ${time2}` +
-  (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
+      const speakLine =
+        `${date1}, ${time1} to ${date2}${date2 !== date1 ? "" : ""} ${time2}` +
+        (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
 
-// If you still want the *real* UTC instants (not needed for filtering), you can compute:
-const utcInstantStart = new Date(startLocal.getTime() - utcOffset*60*60*1000);
-const utcInstantEnd   = new Date(endLocal.getTime()   - utcOffset*60*60*1000);
+      rows.push({
+        employeeNumber: trim(r.employeeNumber || employeeNumber),
+        site,
+        role,
+        utcOffset,
+        hours: s.hours,
+        hourType: trim(s.hourType),
+        hourDescription: trim(s.hourDescription),
+        scheduleDetailID: s.scheduleDetailID,
+        // local wall-clock frame
+        startLocalISO: startLocal.toISOString(),
+        endLocalISO: endLocal.toISOString(),
+        speakLine,
+        concise
+      });
+    }
+  }
 
-rows.push({
-  employeeNumber: trim(r.employeeNumber || employeeNumber),
-  site,
-  role,
-  utcOffset,
-  hours: s.hours,
-  hourType: trim(s.hourType),
-  hourDescription: trim(s.hourDescription),
-  scheduleDetailID: s.scheduleDetailID,
-
-  // Local wall-clock ISO (we compare/filter in this frame)
-  startLocalISO: startLocal.toISOString(),
-  endLocalISO: endLocal.toISOString(),
-
-  // Optional: true UTC instants if you ever need them later
-  // startUTCISO: utcInstantStart.toISOString(),
-  // endUTCISO:   utcInstantEnd.toISOString(),
-
-  speakLine,
-  concise,
-});
-
-
-  // ---------- ALWAYS apply local “now → now+15d” window (per row) ----------
+  // Always apply "now(local) → now+15d" window per row's utcOffset
   const nowUTC = new Date();
   const filtered = rows.filter(r => {
     const startT = Date.parse(r.startLocalISO);
@@ -466,17 +396,16 @@ rows.push({
     return startT >= nowLocal.getTime() && startT <= endLocal.getTime();
   });
 
-  // Sort by soonest start, just in case WinTeam isn’t ordered
+  // Sort by soonest start
   filtered.sort((a, b) => Date.parse(a.startLocalISO) - Date.parse(b.startLocalISO));
 
-  // ---------- Server-side pagination (3 at a time) ----------
+  // Server-side pagination (3 per page)
   const countTotal = filtered.length;
   const p = Math.max(0, pageStart | 0);
   const pageRows = filtered.slice(p, p + 3);
   const nextPageStart = p + 3 < countTotal ? p + 3 : p;
   const hasNext = p + 3 < countTotal;
 
-  // Page speakables & entries
   const speakable_page = pageRows.map(r => r.speakLine);
   const entries_page = pageRows.map(r => ({
     employeeNumber: r.employeeNumber,
@@ -491,7 +420,6 @@ rows.push({
     scheduleDetailID: r.scheduleDetailID
   }));
 
-  // Keep the legacy arrays too (full lists) in case you still use them
   const speakable = filtered.map(r => r.speakLine);
   const entries = filtered.map(r => ({
     employeeNumber: r.employeeNumber,
@@ -516,7 +444,7 @@ rows.push({
     page: { pageStart: p, nextPageStart, hasNext, pageCount: pageRows.length },
     speakable_page,
     entries_page,
-    // legacy fields (if you’ve already wired them)
+    // legacy full lists (if you’re still using them)
     speakable,
     mondayShiftText,
     entries,
@@ -524,6 +452,49 @@ rows.push({
   });
 }
 
+function buildMondayColumnsFromFriendly(body) {
+  const out = {};
+  const addIf = (friendlyKey, transform = (v) => v) => {
+    if (body[friendlyKey] != null && body[friendlyKey] !== "") {
+      const colId = MONDAY_COLUMN_MAP[friendlyKey];
+      if (colId) out[colId] = transform(body[friendlyKey]);
+    }
+  };
+  addIf("division");
+  addIf("department");
+  addIf("site");
+  addIf("email");
+  addIf("phone");
+  addIf("callerId");
+  addIf("reason");
+  addIf("timeInOut");
+  addIf("startTime");
+  addIf("endTime");
+  addIf("deptEmail");
+  addIf("emailStatus");
+  addIf("zoomGuid");
+  addIf("shift");
+
+  if (body.dateTime) {
+    const v = body.dateTime;
+    if (typeof v === "object" && (v.date || v.time)) {
+      out[MONDAY_COLUMN_MAP.dateTime] = v;
+    } else {
+      const ts = Date.parse(String(v));
+      if (!isNaN(ts)) {
+        const d = new Date(ts);
+        out[MONDAY_COLUMN_MAP.dateTime] = {
+          date: `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`,
+          time: `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`
+        };
+      } else {
+        out[MONDAY_COLUMN_MAP.dateTime] = String(v);
+      }
+    }
+  }
+  if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
+  return out;
+}
 
 async function handleMondayWrite(req, env) {
   const body = await readJson(req);
@@ -538,14 +509,10 @@ async function handleMondayWrite(req, env) {
     return json({ success: false, message: "boardId and itemName are required." }, { status: 400 });
   }
 
-  // Build columns:
-  // 1) start with friendly field mapping
   const fromFriendly = buildMondayColumnsFromFriendly(body);
-  // 2) merge any explicit columnValues (explicit wins)
   let explicit = body.columnValues && typeof body.columnValues === "object" ? body.columnValues : {};
   const columnValues = { ...fromFriendly, ...explicit };
 
-  // Optional idempotency
   if (dedupeKey && (await flowGuardSeen(env, dedupeKey))) {
     return json({
       success: true,
@@ -553,11 +520,10 @@ async function handleMondayWrite(req, env) {
       dedupeKey,
       upserted: false,
       item: null,
-      columnValues // echo back what we would have sent
+      columnValues
     });
   }
 
-  // 1) Create item
   const createMutation = `
     mutation ($boardId: Int!, $itemName: String!, $groupId: String) {
       create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
@@ -573,14 +539,13 @@ async function handleMondayWrite(req, env) {
     const res = await mondayGraphQL(env, createMutation, {
       boardId,
       itemName,
-      groupId: groupId || null,
+      groupId: groupId || null
     });
     created = res.create_item;
   } catch (e) {
     return json({ success: false, message: "Monday create_item failed.", detail: String(e) }, { status: 502 });
   }
 
-  // 2) Set columns (if any)
   if (Object.keys(columnValues).length) {
     const changeMutation = `
       mutation ($boardId: Int!, $itemId: Int!, $cv: JSON!) {
@@ -595,7 +560,7 @@ async function handleMondayWrite(req, env) {
       await mondayGraphQL(env, changeMutation, {
         boardId,
         itemId: Number(created.id),
-        cv: cvString,
+        cv: cvString
       });
     } catch (e) {
       return json(
@@ -617,11 +582,29 @@ async function handleMondayWrite(req, env) {
   });
 }
 
-// ------------------- Router -------------------
+// Optional: env presence check (no secret values)
+async function handleEnvDebug(req, env) {
+  const present = (k) => !!env[k];
+  return json({
+    nameHint: "Verify this matches the worker you're deploying",
+    has: {
+      WINTEAM_TENANT_ID: present("WINTEAM_TENANT_ID"),
+      WINTEAM_API_KEY: present("WINTEAM_API_KEY"),
+      MONDAY_API_KEY: present("MONDAY_API_KEY"),
+      MONDAY_DEFAULT_BOARD_ID: present("MONDAY_DEFAULT_BOARD_ID"),
+      FLOW_GUARD: !!env.FLOW_GUARD
+    }
+  });
+}
+
+///////////////////////////////
+// Router (with logging)
+///////////////////////////////
+
 export default {
-  fetch: withLogging(async (req, env, ctx) => {
-    const { method } = req;
+  fetch: withLogging(async (req, env) => {
     const url = new URL(req.url);
+    const { method } = req;
     const path = url.pathname;
 
     // CORS preflight
@@ -632,22 +615,16 @@ export default {
           "access-control-allow-origin": "*",
           "access-control-allow-headers": "content-type, authorization",
           "access-control-allow-methods": "GET,POST,OPTIONS",
-          "access-control-max-age": "86400",
-        },
+          "access-control-max-age": "86400"
+        }
       });
     }
 
-    try {
-      if (method === "POST" && path === "/auth/employee") return await handleAuthEmployee(req, env);
-      if (method === "POST" && path === "/winteam/shifts") return await handleShifts(req, env);
-      if (method === "POST" && path === "/monday/write")  return await handleMondayWrite(req, env);
+    if (method === "GET"  && path === "/debug/env")       return await handleEnvDebug(req, env);
+    if (method === "POST" && path === "/auth/employee")   return await handleAuthEmployee(req, env);
+    if (method === "POST" && path === "/winteam/shifts")  return await handleShifts(req, env);
+    if (method === "POST" && path === "/monday/write")    return await handleMondayWrite(req, env);
 
-      return json(
-        { success: false, message: "Not found. Use POST /auth/employee, /winteam/shifts, /monday/write" },
-        { status: 404 }
-      );
-    } catch (e) {
-      return json({ success: false, message: "Unhandled error.", detail: String(e) }, { status: 500 });
-    }
+    return json({ success: false, message: "Not found. Use POST /auth/employee, /winteam/shifts, /monday/write" }, { status: 404 });
   })
 };
