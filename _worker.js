@@ -515,7 +515,14 @@ async function handleMondayWrite(req, env) {
   const body = await readJson(req);
   if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
 
-  const boardId = Number(body.boardId || env.MONDAY_DEFAULT_BOARD_ID);
+// BEFORE
+// const boardId = Number(body.boardId || env.MONDAY_DEFAULT_BOARD_ID);
+
+// AFTER
+const boardId = String(body.boardId || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
+if (!boardId) {
+  return json({ success:false, message:"boardId is required (set MONDAY_DEFAULT_BOARD_ID or pass boardId)." }, { status: 400 });
+}
   const itemName = trim(body.itemName || body.name || "");
   const groupId = trim(body.groupId || "");
   const dedupeKey = trim(body.dedupeKey || body.engagementId || "");
@@ -539,16 +546,28 @@ async function handleMondayWrite(req, env) {
     });
   }
 
+  // const createMutation = `
+  //   mutation ($boardId: Int!, $itemName: String!, $groupId: String) {
+  //     create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
+  //       id
+  //       name
+  //       board { id }
+  //       group { id }
+  //     }
+  //   }
+  // `;
+
   const createMutation = `
-    mutation ($boardId: Int!, $itemName: String!, $groupId: String) {
-      create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
-        id
-        name
-        board { id }
-        group { id }
-      }
+  mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
+    create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
+      id
+      name
+      board { id }
+      group { id }
     }
-  `;
+  }
+`;
+  
   let created;
   try {
     const res = await mondayGraphQL(env, createMutation, {
@@ -563,7 +582,7 @@ async function handleMondayWrite(req, env) {
 
   if (Object.keys(columnValues).length) {
     const changeMutation = `
-      mutation ($boardId: Int!, $itemId: Int!, $cv: JSON!) {
+      mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
         change_multiple_column_values (board_id: $boardId, item_id: $itemId, column_values: $cv) {
           id
           name
