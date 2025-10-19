@@ -475,12 +475,11 @@ function buildMondayColumnsFromFriendly(body) {
       if (colId) out[colId] = transform(body[friendlyKey]);
     }
   };
+
+  // plain text/status-like fields (we only set if provided)
   addIf("division");
   addIf("department");
   addIf("site");
-  addIf("email");
-  addIf("phone");
-  addIf("callerId");
   addIf("reason");
   addIf("timeInOut");
   addIf("startTime");
@@ -489,7 +488,22 @@ function buildMondayColumnsFromFriendly(body) {
   addIf("emailStatus");
   addIf("zoomGuid");
   addIf("shift");
+  if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
 
+  // ✅ EMAIL column requires an object: { email, text }
+  addIf("email", (v) => {
+    const email = String(v).trim();
+    if (!email || !/@/.test(email)) return undefined;
+    return { email, text: email };
+  });
+
+  // ✅ PHONE columns require an object: { phone, countryShortName }
+  // If you only have a US number, "US" is fine. Strip spaces/formatting.
+  const normPhone = (raw) => String(raw).replace(/[^\d+]/g, "").trim();
+  addIf("phone",   (v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
+  addIf("callerId",(v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
+
+  // ✅ DATE/TIME column can accept either a prebuilt object or an ISO-like string
   if (body.dateTime) {
     const v = body.dateTime;
     if (typeof v === "object" && (v.date || v.time)) {
@@ -499,17 +513,18 @@ function buildMondayColumnsFromFriendly(body) {
       if (!isNaN(ts)) {
         const d = new Date(ts);
         out[MONDAY_COLUMN_MAP.dateTime] = {
-          date: `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`,
-          time: `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`
+          date: `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`,
+          time: `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}:${String(d.getUTCSeconds()).padStart(2,"0")}`
         };
-      } else {
-        out[MONDAY_COLUMN_MAP.dateTime] = String(v);
       }
     }
   }
-  if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
+
+  // Remove any undefined values (failed validations)
+  for (const k of Object.keys(out)) { if (out[k] === undefined) delete out[k]; }
   return out;
 }
+
 
 async function handleMondayWrite(req, env) {
   const body = await readJson(req);
