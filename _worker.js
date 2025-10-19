@@ -352,13 +352,12 @@ async function handleShifts(req, env) {
   if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
 
   const employeeNumber = trim(body.employeeNumber);
+  // optional server-side pagination (default 0)
+  const pageStart = Number(trim(body.pageStart ?? "0")) || 0;
+
   if (!employeeNumber) {
     return json({ success: false, message: "employeeNumber is required." }, { status: 400 });
   }
-
-  // Optional filter window for convenience (UTC yyyy-mm-dd); used for post-filtering
-  const fromISO = trim(body.from) || ymd(new Date());
-  const toISO   = trim(body.to)   || ymd(addDaysUTC(new Date(), 15));
 
   // Exact endpoint + param
   const url = new URL(SHIFTS_BASE_EXACT);
@@ -372,7 +371,7 @@ async function handleShifts(req, env) {
     );
   }
 
-  // Shape: data[0].results[*] => { jobDescription, postDescription, utCoffset, shifts: [{startTime, endTime, ...}] }
+  // data[0].results[*] => { jobDescription, postDescription, utCoffset, shifts:[...] }
   const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
   const results = Array.isArray(page?.results) ? page.results : [];
 
@@ -388,32 +387,26 @@ async function handleShifts(req, env) {
       let endUTC = parseNoTZToUTC(s.endTime);
       if (!startUTC || !endUTC) continue;
 
-      // Convert to "local" using utCoffset: local = UTC + offsetHours
+      // Convert to "local wall-clock" frame using utCoffset: local = UTC + offsetHours
       const startLocal = addHours(startUTC, utcOffset);
       let endLocal = addHours(endUTC, utcOffset);
 
       // Overnight support
-      if (endLocal.getTime() <= startLocal.getTime()) {
-        endLocal = addHours(endLocal, 24);
-      }
+      if (endLocal.getTime() <= startLocal.getTime()) endLocal = addHours(endLocal, 24);
 
       const date1 = weekdayMonthDay(startLocal);
       const date2 = weekdayMonthDay(endLocal);
       const time1 = fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes());
       const time2 = fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes());
 
-      // Concise for Monday
       const concise =
         `${ymdFromDate(startLocal)} ${pad2(startLocal.getUTCHours())}:${pad2(startLocal.getUTCMinutes())}` +
         ` → ${pad2(endLocal.getUTCHours())}:${pad2(endLocal.getUTCMinutes())}` +
-        (site ? ` @ ${site}` : "") +
-        (role ? ` (${role})` : "");
+        (site ? ` @ ${site}` : "") + (role ? ` (${role})` : "");
 
-      // Speakable for agent
       const speakLine =
         `${date1}, ${time1} to ${date2}${date2 !== date1 ? "" : ""} ${time2}` +
-        (site ? ` at ${site}` : "") +
-        (role ? ` (${role})` : "");
+        (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
 
       rows.push({
         employeeNumber: trim(r.employeeNumber || employeeNumber),
@@ -432,16 +425,45 @@ async function handleShifts(req, env) {
     }
   }
 
-  // Optional post-filter
-  const fromT = Date.parse(fromISO + "T00:00:00Z");
-  const toT   = Date.parse(toISO   + "T23:59:59Z");
+  // ---------- ALWAYS apply local “now → now+15d” window (per row) ----------
+  const nowUTC = new Date();
   const filtered = rows.filter(r => {
-    const t = Date.parse(r.startLocalISO);
-    if (isNaN(t)) return true;
-    return t >= fromT && t <= toT;
+    const startT = Date.parse(r.startLocalISO);
+    if (isNaN(startT)) return false;
+    const offset = Number(r.utcOffset || 0);
+    const nowLocal = new Date(nowUTC.getTime());
+    nowLocal.setUTCHours(nowLocal.getUTCHours() + offset);
+    const endLocal = new Date(nowLocal.getTime());
+    endLocal.setUTCDate(endLocal.getUTCDate() + 15);
+    return startT >= nowLocal.getTime() && startT <= endLocal.getTime();
   });
 
-  // Outputs for Option A
+  // Sort by soonest start, just in case WinTeam isn’t ordered
+  filtered.sort((a, b) => Date.parse(a.startLocalISO) - Date.parse(b.startLocalISO));
+
+  // ---------- Server-side pagination (3 at a time) ----------
+  const countTotal = filtered.length;
+  const p = Math.max(0, pageStart | 0);
+  const pageRows = filtered.slice(p, p + 3);
+  const nextPageStart = p + 3 < countTotal ? p + 3 : p;
+  const hasNext = p + 3 < countTotal;
+
+  // Page speakables & entries
+  const speakable_page = pageRows.map(r => r.speakLine);
+  const entries_page = pageRows.map(r => ({
+    employeeNumber: r.employeeNumber,
+    site: r.site,
+    role: r.role,
+    startLocalISO: r.startLocalISO,
+    endLocalISO: r.endLocalISO,
+    hours: r.hours,
+    concise: r.concise,
+    hourType: r.hourType,
+    hourDescription: r.hourDescription,
+    scheduleDetailID: r.scheduleDetailID
+  }));
+
+  // Keep the legacy arrays too (full lists) in case you still use them
   const speakable = filtered.map(r => r.speakLine);
   const entries = filtered.map(r => ({
     employeeNumber: r.employeeNumber,
@@ -455,12 +477,18 @@ async function handleShifts(req, env) {
     hourDescription: r.hourDescription,
     scheduleDetailID: r.scheduleDetailID
   }));
-  const mondayShiftText = entries.length ? entries[0].concise : "";
+
+  const mondayShiftText = entries[0]?.concise || "";
 
   return json({
     success: true,
     message: "Shifts lookup completed.",
-    query: { employeeNumber, from: fromISO, to: toISO },
+    window: "now(local) → now+15d",
+    counts: { rows: rows.length, filtered: countTotal },
+    page: { pageStart: p, nextPageStart, hasNext, pageCount: pageRows.length },
+    speakable_page,
+    entries_page,
+    // legacy fields (if you’ve already wired them)
     speakable,
     mondayShiftText,
     entries,
@@ -468,58 +496,6 @@ async function handleShifts(req, env) {
   });
 }
 
-// Build column_values from either raw columnValues or friendly fields
-function buildMondayColumnsFromFriendly(body) {
-  const out = {};
-  const addIf = (friendlyKey, transform = (v) => v) => {
-    if (body[friendlyKey] != null && body[friendlyKey] !== "") {
-      const colId = MONDAY_COLUMN_MAP[friendlyKey];
-      if (colId) out[colId] = transform(body[friendlyKey]);
-    }
-  };
-
-  // Strings are fine for most types. You can supply richer objects if desired.
-  addIf("division");
-  addIf("department");
-  addIf("site");
-  addIf("email");
-  addIf("phone");
-  addIf("callerId");
-  addIf("reason");
-  addIf("timeInOut");
-  addIf("startTime");
-  addIf("endTime");
-  addIf("deptEmail");
-  addIf("emailStatus");
-  addIf("zoomGuid");
-  addIf("shift");
-
-  // Date column allows JSON like {date:"YYYY-MM-DD", time:"HH:MM:SS"}.
-  // Accept plain strings too.
-  if (body.dateTime) {
-    const v = body.dateTime;
-    if (typeof v === "object" && (v.date || v.time)) {
-      out[MONDAY_COLUMN_MAP.dateTime] = v;
-    } else {
-      // try to parse ISO and split
-      const ts = Date.parse(String(v));
-      if (!isNaN(ts)) {
-        const d = new Date(ts);
-        out[MONDAY_COLUMN_MAP.dateTime] = {
-          date: `${d.getUTCFullYear()}-${pad2(d.getUTCMonth()+1)}-${pad2(d.getUTCDate())}`,
-          time: `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`
-        };
-      } else {
-        out[MONDAY_COLUMN_MAP.dateTime] = String(v);
-      }
-    }
-  }
-
-  // Echo item id if you want (rare)
-  if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
-
-  return out;
-}
 
 async function handleMondayWrite(req, env) {
   const body = await readJson(req);
