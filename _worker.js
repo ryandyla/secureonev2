@@ -45,6 +45,99 @@ const MONDAY_COLUMN_MAP = {
 ///////////////////////////////
 // Tiny utils
 ///////////////////////////////
+// --- helpers: drop these near your other small utils ---
+function deriveDepartmentFromReason(reasonRaw = "") {
+  const r = String(reasonRaw).toLowerCase();
+
+  // Payroll first (pay/payroll/check)
+  if (/\b(payroll|pay\s*issue|pay\s*check|pay\s*stub|w2|w-?2|tax|withhold)/i.test(r)) return "Payroll";
+
+  // Training keywords
+  if (/\b(training|train|course|lms|cert|certificate|guard\s*card)/i.test(r)) return "Training";
+
+  // Ops-y catch: call offs, incidents, punches, timecards
+  if (
+    /\b(call\s*off|calloff|no\s*show|incident|report|time\s*card|timecard|punch|missed\s*punch|late|coverage|schedule)/i.test(r)
+  ) return "Operations";
+
+  return "Other";
+}
+
+function mondayStatusLabel(label) {
+  const v = String(label || "").trim();
+  return v ? { label: v } : undefined;
+}
+
+// --- replace your existing buildMondayColumnsFromFriendly with this ---
+function buildMondayColumnsFromFriendly(body) {
+  const out = {};
+  const addIf = (friendlyKey, transform = (v) => v) => {
+    if (body[friendlyKey] != null && body[friendlyKey] !== "") {
+      const colId = MONDAY_COLUMN_MAP[friendlyKey];
+      if (colId) out[colId] = transform(body[friendlyKey]);
+    }
+  };
+
+  // 1) Plain text-ish fields
+  addIf("site");        // Account/Site: text
+  addIf("reason");      // Call Issue/Reason: text
+  addIf("timeInOut");
+  addIf("startTime");
+  addIf("endTime");
+  addIf("deptEmail");
+  addIf("emailStatus"); // If this is also a status column in your board, convert it to {label:...} like below
+  addIf("zoomGuid");
+  addIf("shift");
+  if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
+
+  // 2) EMAIL → { email, text }
+  addIf("email", (v) => {
+    const email = String(v).trim();
+    if (!email || !/@/.test(email)) return undefined;
+    return { email, text: email };
+  });
+
+  // 3) PHONE / CALLER ID → { phone, countryShortName }
+  const normPhone = (raw) => String(raw).replace(/[^\d+]/g, "").trim();
+  addIf("phone",   (v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
+  addIf("callerId",(v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
+
+  // 4) DATE/TIME
+  if (body.dateTime) {
+    const v = body.dateTime;
+    if (typeof v === "object" && (v.date || v.time)) {
+      out[MONDAY_COLUMN_MAP.dateTime] = v;
+    } else {
+      const ts = Date.parse(String(v));
+      if (!isNaN(ts)) {
+        const d = new Date(ts);
+        out[MONDAY_COLUMN_MAP.dateTime] = {
+          date: `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`,
+          time: `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}:${String(d.getUTCSeconds()).padStart(2,"0")}`
+        };
+      }
+    }
+  }
+
+  // 5) DIVISION (status column) — prefer explicit, else derive from ofcWorkstate/workState/state
+  const explicitDivision = String(body.division || "").trim();
+  let divisionSource = explicitDivision ||
+                       String(body.ofcWorkstate || body.workState || body.state || "").trim();
+  if (divisionSource) {
+    out[MONDAY_COLUMN_MAP.division] = mondayStatusLabel(divisionSource);
+  }
+
+  // 6) DEPARTMENT (status column) — prefer explicit, else derive from reason
+  const explicitDept = String(body.department || "").trim();
+  const dept = explicitDept || deriveDepartmentFromReason(body.reason || "");
+  if (dept) {
+    out[MONDAY_COLUMN_MAP.department] = mondayStatusLabel(dept);
+  }
+
+  // Remove undefined values
+  for (const k of Object.keys(out)) { if (out[k] === undefined) delete out[k]; }
+  return out;
+}
 
 const json = (obj, { status = 200, cors = true } = {}) =>
   new Response(JSON.stringify(obj, null, 2), {
@@ -178,6 +271,33 @@ function withLogging(handler) {
 ///////////////////////////////
 // HTTP helpers
 ///////////////////////////////
+// Map state postal codes to full names for Monday "Division:" status labels
+const STATE_FULL = {
+  AL:"Alabama", AK:"Alaska", AZ:"Arizona", AR:"Arkansas", CA:"California",
+  CO:"Colorado", CT:"Connecticut", DE:"Delaware", FL:"Florida", GA:"Georgia",
+  HI:"Hawaii", ID:"Idaho", IL:"Illinois", IN:"Indiana", IA:"Iowa",
+  KS:"Kansas", KY:"Kentucky", LA:"Louisiana", ME:"Maine", MD:"Maryland",
+  MA:"Massachusetts", MI:"Michigan", MN:"Minnesota", MS:"Mississippi", MO:"Missouri",
+  MT:"Montana", NE:"Nebraska", NV:"Nevada", NH:"New Hampshire", NJ:"New Jersey",
+  NM:"New Mexico", NY:"New York", NC:"North Carolina", ND:"North Dakota", OH:"Ohio",
+  OK:"Oklahoma", OR:"Oregon", PA:"Pennsylvania", RI:"Rhode Island", SC:"South Carolina",
+  SD:"South Dakota", TN:"Tennessee", TX:"Texas", UT:"Utah",
+  VT:"Vermont", VA:"Virginia", WA:"Washington", WV:"West Virginia",
+  WI:"Wisconsin", WY:"Wyoming", DC:"District of Columbia", PR:"Puerto Rico"
+};
+
+function stateFromSupervisor(supervisorDescription = "") {
+  // Examples: "IL Ops Team", "AZ Operations", "TX Night Shift"
+  const m = String(supervisorDescription).trim().match(/^([A-Z]{2})\b/);
+  if (!m) return "";
+  const full = STATE_FULL[m[1]];
+  return full || "";
+}
+
+function mondayStatusLabel(label) {
+  const v = String(label || "").trim();
+  return v ? { label: v } : undefined;
+}
 
 async function readJson(req) {
   try {
@@ -477,7 +597,29 @@ function buildMondayColumnsFromFriendly(body) {
   };
 
   // plain text/status-like fields (we only set if provided)
-  addIf("division");
+  // 5) DIVISION (status column)
+  // Priority: explicit "division" in body → supervisorDescription-derived state → ofcWorkstate/workState/state
+  const explicitDivision = String(body.division || "").trim();
+
+  let derivedDivision = "";
+  if (!explicitDivision) {
+    // try supervisorDescription like "IL Ops Team"
+    derivedDivision = stateFromSupervisor(body.supervisorDescription);
+    if (!derivedDivision) {
+      // fall back to state-like fields (convert code to full name if necessary)
+      const rawState = String(body.ofcWorkstate || body.workState || body.state || "").trim();
+      if (rawState.length === 2 && STATE_FULL[rawState.toUpperCase()]) {
+        derivedDivision = STATE_FULL[rawState.toUpperCase()];
+      } else if (rawState) {
+        derivedDivision = rawState; // already a full name
+      }
+    }
+  }
+
+  const finalDivision = explicitDivision || derivedDivision;
+  if (finalDivision) {
+    out[MONDAY_COLUMN_MAP.division] = mondayStatusLabel(finalDivision);
+  }
   addIf("department");
   addIf("site");
   addIf("reason");
