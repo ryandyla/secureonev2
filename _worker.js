@@ -38,7 +38,7 @@ const MONDAY_COLUMN_MAP = {
   deptEmail: "text_mkv07gad",     // "Department Email:"
   emailStatus: "color_mkv0cpxc",  // "Email Status:" (Status if used)
   itemIdEcho: "pulse_id_mkv6rhgy",
-  zoomGuid: "text_mkv7j2fq",
+  zoomGuid: "text_mkv7j2fq",      // "Zoom Call GUID"
   shift: "text_mkwn6bzw"
 };
 
@@ -520,7 +520,7 @@ function buildMondayColumnsFromFriendly(body) {
   addIf("startTime");
   addIf("endTime");
   addIf("deptEmail");
-  addIf("zoomGuid");
+  addIf("zoomGuid");     // ← engagementId is normalized into zoomGuid before we get here
   addIf("shift");
   // If you want emailStatus as a Status too, convert via mondayStatusLabel:
   // addIf("emailStatus", (v) => mondayStatusLabel(v));
@@ -592,6 +592,15 @@ async function handleMondayWrite(req, env) {
   const body = await readJson(req);
   if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
 
+  // Normalize engagement id across possible field names from ZVA:
+  // - engagementId (preferred, from global_system.Engagement.engagementId)
+  // - zoomEngId / zoomGuid (legacy/alt)
+  let engagementId = trim(body.engagementId || body.zoomEngId || body.zoomGuid || "");
+  if (engagementId && !body.zoomGuid) {
+    // Ensure it lands in the Zoom Call GUID column
+    body.zoomGuid = engagementId;
+  }
+
   // Accept explicit boardId in body, or env vars (strings for ID!)
   const boardId = String(
     body.boardId ||
@@ -605,13 +614,20 @@ async function handleMondayWrite(req, env) {
 
   const itemName = trim(body.itemName || body.name || "");
   const groupId = trim(body.groupId || "");
-  const dedupeKey = trim(body.dedupeKey || body.engagementId || "");
+
+  // Prefer provided dedupeKey; else engagementId; else composite engagementId:employeeNumber if both exist
+  const employeeNumber = trim(body.employeeNumber || body.ofcEmployeeNumber || "");
+  let dedupeKey = trim(body.dedupeKey || "");
+  if (!dedupeKey) {
+    if (engagementId && employeeNumber) dedupeKey = `${engagementId}:${employeeNumber}`;
+    else if (engagementId) dedupeKey = engagementId;
+  }
 
   if (!itemName) {
     return json({ success: false, message: "itemName is required." }, { status: 400 });
   }
 
-  // Build columns (auto-derive Division/Department/email/phone formats)
+  // Build columns (auto-derive Division/Department/email/phone formats, and include zoomGuid)
   const columnValues = buildMondayColumnsFromFriendly(body);
 
   // Idempotency guard (optional)
@@ -682,6 +698,7 @@ async function handleMondayWrite(req, env) {
     boardId,
     item: created,
     dedupeKey: dedupeKey || null,
+    engagementId: engagementId || null,
     columnValuesSent: columnValues
   });
 }
