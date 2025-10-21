@@ -719,6 +719,133 @@ async function handleEnvDebug(req, env) {
   });
 }
 
+// It expects JSON: { employeeNumber, selectionIndex, reason, ani, engagementId, pageStart? }
+
+async function handleZvaShiftWrite(request, env, ctx) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  // Unwrap if someone sends {json:{...}} or {data:{...}}
+  if (body && typeof body === "object") {
+    if (body.json && typeof body.json === "object") body = body.json;
+    else if (body.data && typeof body.data === "object") body = body.data;
+  }
+
+  const employeeNumber = String(body.employeeNumber || "").trim();
+  const selectionIndex = Number(body.selectionIndex ?? 0) || 0; // 0,1,2 from the agent’s list
+  const reason         = (body.reason ?? "calling off sick").toString().trim();
+  const ani            = (body.ani || "").toString().trim();
+  const engagementId   = (body.engagementId || "").toString().trim();
+  const pageStart      = Number(body.pageStart ?? 0) || 0;
+
+  if (!employeeNumber) {
+    return json({ success:false, message:"employeeNumber required" }, { status:400 });
+  }
+
+  // Build origin of THIS worker so we can call sibling endpoints
+  const origin = new URL(request.url).origin;
+
+  // 1) Pull the current page of shifts from our own worker (or swap to your internal function if you prefer)
+  let shiftsResp, shifts;
+  try {
+    const url = new URL("/winteam/shifts", origin);
+    url.searchParams.set("employeeNumber", employeeNumber);
+    url.searchParams.set("pageStart", String(pageStart));
+    shiftsResp = await fetch(url, { method:"GET" });
+    shifts = await shiftsResp.json();
+  } catch (e) {
+    return json({ success:false, message:`Failed to fetch shifts: ${e.message || e}` }, { status:502 });
+  }
+
+  const entries = Array.isArray(shifts?.entries) ? shifts.entries : [];
+  if (!entries.length) {
+    return json({ success:false, message:"No shifts returned for employee." }, { status:404 });
+  }
+
+  const e = entries[Math.min(Math.max(selectionIndex, 0), Math.min(2, entries.length - 1))];
+
+  // Normalize the fields we need for Monday
+  const site       = (e.site || e.siteName || "").toString().trim();
+  const startISO   = (e.startLocalISO || e.startIso || "").toString().trim();
+  const endISO     = (e.endLocalISO   || e.endIso   || "").toString().trim();
+  const role       = (e.role || e.roleName || "").toString().trim();
+  const emp        = employeeNumber;
+
+  // Build a stable itemName and dedupeKey
+  const itemName = `${emp || "unknown"} | ${(shifts?.employeeName || "").toString().trim() || "Unknown Caller"}`;
+  const dateKey = startISO ? startISO.slice(0,10) : "date?";
+  const dedupeKey = engagementId || [emp || "emp?", site || "site?", dateKey].join("|");
+
+  // CallerID normalization (US-centric like before)
+  const normPhone = (raw) => {
+    if (!raw) return "";
+    const s = String(raw);
+    const e164 = s.trim().startsWith("+") ? s.replace(/[^\+\d]/g, "") : null;
+    const d = s.replace(/\D+/g, "");
+    if (e164 && /^\+\d{8,15}$/.test(e164)) return e164;
+    if (d.length === 11 && d[0] === "1") return "+" + d;
+    if (d.length === 10) return "+1" + d;
+    return "";
+  };
+
+  const callerId = normPhone(ani);
+
+  // 2) Call your existing /monday/write with the exact body it expects
+  //    (We only send non-empty keys so the worker doesn't write blanks.)
+  const mondayBody = { itemName, dedupeKey };
+  if (site)       mondayBody.accountSite = site;
+  if (startISO)   mondayBody.shiftStart  = startISO;
+  if (endISO)     mondayBody.shiftEnd    = endISO;
+  if (callerId)   mondayBody.callerId    = callerId;
+  if (reason)     mondayBody.reason      = reason;
+  if (engagementId) mondayBody.engagementId = engagementId;
+
+  let mResp, mData;
+  try {
+    mResp = await fetch(`${origin}/monday/write`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(mondayBody)
+    });
+    mData = await mResp.json();
+  } catch (e) {
+    return json({ success:false, message:`Monday write failed: ${e.message || e}` }, { status:502 });
+  }
+
+  return json({
+    success: !!mData?.success,
+    message: mData?.message || "Done.",
+    sent: { itemName, dedupeKey, site, startISO, endISO, callerId, reason, engagementId },
+    monday: mData
+  }, { status: mData?.success ? 200 : 500 });
+}
+
+// --- tiny JSON helper used above ---
+function json(obj, init) {
+  return new Response(JSON.stringify(obj), {
+    headers: { "content-type": "application/json; charset=utf-8" },
+    ...(init || {})
+  });
+}
+
+// In your main fetch router:
+addEventListener("fetch", event => {
+  event.respondWith(handle(event.request, event));
+});
+
+async function handle(request, event) {
+  const url = new URL(request.url);
+  const path = url.pathname;
+  // ...your existing routes
+  if (request.method === "POST" && path === "/zva/shift-write") {
+    return handleZvaShiftWrite(request, event.env, event);
+  }
+  // fall through to existing handlers...
+  // return handleOther(request, event);
+  return new Response("Not found", { status: 404 });
+}
+
+
+
 ///////////////////////////////
 // Router (with logging)
 ///////////////////////////////
