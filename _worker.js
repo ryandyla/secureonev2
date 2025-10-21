@@ -486,6 +486,39 @@ async function handleShifts(req, env) {
     scheduleDetailID: r.scheduleDetailID
   }));
 
+  // Shift date param accept // 
+  const url = new URL(request.url);
+  const dateFrom = url.searchParams.get("dateFrom"); // YYYY-MM-DD
+  const dateTo   = url.searchParams.get("dateTo");   // YYYY-MM-DD
+  
+  function inRange(iso, fromYmd, toYmd) {
+    if (!fromYmd || !toYmd || !iso) return true;
+    // compare on date (midnight boundaries); treat iso as UTC date
+    const d = new Date(iso);
+    if (isNaN(d)) return false;
+    const ymd = d.toISOString().slice(0,10);
+    return (ymd >= fromYmd && ymd < toYmd);
+  }
+  
+  let filtered = Array.isArray(entries) ? entries : [];
+  if (dateFrom && dateTo) {
+    filtered = filtered.filter(e =>
+      inRange(e.startLocalISO || e.startIso, dateFrom, dateTo) ||
+      inRange(e.endLocalISO   || e.endIso,   dateFrom, dateTo)
+    );
+  }
+  
+  // then continue returning the same shape you already return, but with `entries: filtered`
+  return json({
+    success: true,
+    message: "Shifts lookup completed.",
+    counts: { rows: filtered.length, filtered: filtered.length },
+    page: { pageStart, nextPageStart, hasNext },
+    entries: filtered,
+    // you can still include entries_page/speakable_page if your front end expects them
+  });
+
+  
   const mondayShiftText = entries[0]?.concise || "";
 
   return json({
