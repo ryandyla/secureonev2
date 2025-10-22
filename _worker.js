@@ -381,15 +381,16 @@ wtUrl.searchParams.set("toDate", toDate);
   }
 
   // ---- Pull a 15-day window from WinTeam ----
+  // ---- Choose window for WinTeam request (honor body dateFrom/dateTo if provided) ----
   const startBase = nowAnchor();
-  const fromDate = ymd(startBase);
-  const toDate   = ymd(addDaysUTC(startBase, 15));
-
+  const winFrom = dateFrom || ymd(startBase);
+  const winTo   = dateTo   || ymd(addDaysUTC(startBase, 15));
+  
   const wtUrl = new URL(SHIFTS_BASE_EXACT);
   wtUrl.searchParams.set("employeeNumber", employeeNumber);
-  wtUrl.searchParams.set("fromDate", fromDate);
-  wtUrl.searchParams.set("toDate", toDate);
-
+  wtUrl.searchParams.set("fromDate", winFrom);
+  wtUrl.searchParams.set("toDate", winTo);
+  
   const wt = await callWinTeamJSON(wtUrl.toString(), env);
   if (!wt.ok) {
     return json(
