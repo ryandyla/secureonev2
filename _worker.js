@@ -927,7 +927,7 @@ async function handleZvaShiftWriteByCell(req, env) {
     phone: employee?.phone1 || ""        // phone_mktdphra
   };
   const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
-
+  const boardId = String(env.MONDAY_BOARD_ID);
   const cvString = JSON.stringify(columnValues);
 
   // Create item
