@@ -586,49 +586,58 @@ async function handleMondayWrite(req, env) {
   if (engagementId && !body.zoomGuid) body.zoomGuid = engagementId;
 
   // Board ID
-  const boardId = String(body.boardId || env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
+  // --- Monday write (direct, no self-call) ---
+
+  // Dedupe via FLOW_GUARD
+  const boardId = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) {
-    return json({ success:false, message:"boardId is required (env or body)." }, { status: 400 });
+    return json({ success:false, message:"boardId is required (env MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID)." }, { status:400 });
   }
 
-  const itemName = trim(body.itemName || body.name || "");
-  const groupId = trim(body.groupId || "");
-  if (!itemName) return json({ success: false, message: "itemName is required." }, { status: 400 });
-
-  // Dedupe Key
-  const employeeNumber = trim(body.employeeNumber || body.ofcEmployeeNumber || "");
-  let dedupeKey = trim(body.dedupeKey || "");
-  if (!dedupeKey) {
-    if (engagementId && employeeNumber) dedupeKey = `${engagementId}:${employeeNumber}`;
-    else if (engagementId) dedupeKey = engagementId;
-  }
-
-  const columnValues = buildMondayColumnsFromFriendly(body);
-
+  const dedupeKey = engagementId || [employeeNumber || "emp?", site || "site?", (startISO||"").slice(0,10) || "date?"].join("|");
   if (dedupeKey && (await flowGuardSeen(env, dedupeKey))) {
-    return json({ success: true, message: "Duplicate suppressed by flow guard.", dedupeKey, upserted: false, item: null, columnValues });
+    return json({
+      success: true,
+      message: "Duplicate suppressed by flow guard.",
+      sent: { employeeNumber, cellId, site, startISO, endISO, reason, callerId, engagementId, itemName, dedupeKey },
+      monday: { upserted:false, item:null }
+    });
   }
 
-  // Create item
+  // Build column values using your friendly → Monday mapping
+  const cvFriendly = {
+    site,                         // text_mktj4gmt
+    reason,                       // text_mktdb8pg
+    callerId,                     // phone_mkv0p9q3 (phone format handled in builder)
+    startTime: startISO,          // text_mkv0t29z (kept as text)
+    endTime: endISO,              // text_mkv0nmq1
+    zoomGuid: engagementId || "", // text_mkv7j2fq
+    // optional nice one-line summary:
+    shift: `${(startISO||"").slice(0,16)} → ${(endISO||"").slice(11,16)} @ ${site || ""}`.trim()
+  };
+  const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
+  const cvString = JSON.stringify(columnValues);
+
+  // Create Monday item
   const createMutation = `
-    mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
-      create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
+    mutation ($boardId: ID!, $itemName: String!) {
+      create_item (board_id: $boardId, item_name: $itemName) {
         id
         name
         board { id }
-        group { id }
       }
     }
   `;
   let created;
   try {
-    const res = await mondayGraphQL(env, createMutation, { boardId, itemName, groupId: groupId || null });
+    const res = await mondayGraphQL(env, createMutation, { boardId, itemName });
     created = res.create_item;
   } catch (e) {
-    return json({ success: false, message: "Monday create_item failed.", detail: String(e) }, { status: 502 });
+    console.log("ZVA DEBUG writer: Monday create_item threw", String(e?.message || e));
+    return json({ success:false, message:`Monday create_item failed: ${e?.message || e}` }, { status:502 });
   }
 
-  // Update columns
+  // Apply columns
   if (Object.keys(columnValues).length) {
     const changeMutation = `
       mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
@@ -638,11 +647,11 @@ async function handleMondayWrite(req, env) {
         }
       }
     `;
-    const cvString = JSON.stringify(columnValues);
     try {
       await mondayGraphQL(env, changeMutation, { boardId, itemId: String(created.id), cv: cvString });
     } catch (e) {
-      return json({ success: false, message: "Monday change_multiple_column_values failed.", createdItem: created, detail: String(e) }, { status: 502 });
+      console.log("ZVA DEBUG writer: Monday change_multiple_column_values threw", String(e?.message || e));
+      return json({ success:false, message:`Monday change columns failed: ${e?.message || e}` }, { status:502 });
     }
   }
 
@@ -651,13 +660,10 @@ async function handleMondayWrite(req, env) {
   return json({
     success: true,
     message: "Monday item created/updated.",
-    boardId,
-    item: created,
-    dedupeKey: dedupeKey || null,
-    engagementId: engagementId || null,
-    columnValuesSent: columnValues
+    sent: { employeeNumber, cellId, site, startISO, endISO, reason, callerId, engagementId, itemName, dedupeKey },
+    monday: { item: created, columnValuesSent: columnValues }
   });
-}
+
 
 // It expects JSON: { employeeNumber, selectionIndex, reason, ani, engagementId, pageStart? }
 async function handleZvaShiftWrite(req, env) {
