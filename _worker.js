@@ -885,8 +885,7 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
   const want = String(cellId || "").trim();
   if (!want) return null;
 
-  // If you can pass a date from ZVA, it greatly narrows the search.
-  // We'll use [dateHint, dateHint+1] if provided; else let the worker's 15-day window apply.
+  // Prefer a tight [dateHint, dateHint+1) window if provided; else let /winteam/shifts default (now→now+15d).
   const body = { employeeNumber };
   if (dateHint) {
     try {
@@ -907,24 +906,30 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
   });
   const j = await r.json();
 
-  // Prefer full list; fallback to page list
-  const arr = Array.isArray(j?.entries) ? j.entries
-            : Array.isArray(j?.entries_page) ? j.entries_page
-            : [];
+ const arr = Array.isArray(j?.entries) ? j.entries
+          : Array.isArray(j?.entries_page) ? j.entries_page
+          : [];
 
-  // Find matching cellId (string-safe)
-  const hit = arr.find(e => String(e?.cellId || "").trim() === want);
-  if (!hit) return null;
+const want = String(cellId || "").trim();
+const hit = arr.find(e => String(e?.cellId ?? "").trim() === want);
+if (!hit) {
+  console.log("cellId not found; sample ids:", arr.slice(0,30).map(x => x?.cellId).filter(Boolean));
+  return null;
+}
+
+    return null;
+  }
 
   // Normalize what the writer needs
   return {
-    cellId: String(hit.cellId ?? hit.id ?? hit.scheduleDetailID ?? "").trim(),
-    site: String(hit.site || hit.siteName || "").trim(),
-    siteName: String(hit.site || hit.siteName || "").trim(),
-    startLocalISO: String(hit.startLocalISO || hit.startIso || "").trim(),
-    endLocalISO:   String(hit.endLocalISO   || hit.endIso   || "").trim()
+    cellId: norm(hit.cellId),
+    site: norm(hit.site || hit.siteName),
+    siteName: norm(hit.site || hit.siteName),
+    startLocalISO: norm(hit.startLocalISO || hit.startIso),
+    endLocalISO:   norm(hit.endLocalISO   || hit.endIso)
   };
 }
+
 
 
 ///////////////////////////////
