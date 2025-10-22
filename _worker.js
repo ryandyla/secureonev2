@@ -1011,12 +1011,9 @@ export default {
       });
     }
 
-    if (method === "GET"  && path === "/debug/env")                 return await handleEnvDebug(req, env);
-
     if (method === "POST" && path === "/auth/employee")             return await handleAuthEmployee(req, env);
     if (method === "POST" && path === "/winteam/shifts")            return await handleShifts(req, env);
     if (method === "POST" && path === "/monday/write")              return await handleMondayWrite(req, env);
-
     if (method === "POST" && path === "/zva/shift-write")           return await handleZvaShiftWrite(req, env);
     if (method === "POST" && path === "/zva/shift-write-by-cell")   return await handleZvaShiftWriteByCell(req, env);
 
