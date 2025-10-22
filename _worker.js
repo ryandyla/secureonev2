@@ -366,11 +366,6 @@ async function handleShifts(req, env) {
   }
 
   const employeeNumber = trim(body.employeeNumber);
-  // ---- Choose window for WinTeam request ----
-  const startBase = nowAnchor();
-  const fromDate = dateFrom || ymd(startBase);
-  const toDate   = dateTo   || ymd(addDaysUTC(startBase, 15));
-
   if (!employeeNumber) {
     return json({ success:false, message:"employeeNumber is required." }, { status:400 });
   }
