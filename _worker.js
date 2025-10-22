@@ -733,6 +733,7 @@ async function handleZvaShiftWrite(req, env) {
 }
 
 // Write by cellId (preferred)
+// Write by cellId (preferred)
 async function handleZvaShiftWriteByCell(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -749,39 +750,52 @@ async function handleZvaShiftWriteByCell(req, env) {
   if (!cellId)         return json({ success:false, message:"cellId required" }, { status:400 });
 
   const origin = new URL(req.url).origin;
-  const normPhone = (raw)=> {
+
+  const normPhone = (raw) => {
     if (!raw) return "";
-    const s=String(raw);
-    const e=s.trim().startsWith("+")?s.replace(/[^\+\d]/g,""):null;
-    const d=s.replace(/\D+/g,"");
+    const s = String(raw);
+    const e = s.trim().startsWith("+") ? s.replace(/[^\+\d]/g, "") : null;
+    const d = s.replace(/\D+/g, "");
     if (e && /^\+\d{8,15}$/.test(e)) return e;
-    if (d.length===11 && d[0]==="1") return "+"+d;
-    if (d.length===10) return "+1"+d;
+    if (d.length === 11 && d[0] === "1") return "+" + d;
+    if (d.length === 10) return "+1" + d;
     return "";
   };
 
-  // TODO: wire to your real WinTeam helpers
-  const employee = await fetchEmployeeDetail(employeeNumber, env).catch(()=>null);
+  // Caller identity (optional)
+  const callerId = normPhone(aniRaw);
+
+  // Pull basic employee info (best-effort)
+  let employee = null;
+  try {
+    employee = await fetchEmployeeDetail(employeeNumber, env);
+  } catch (e) {
+    console.log("ZVA DEBUG writer: fetchEmployeeDetail threw", String(e && e.message || e));
+  }
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
-  // --- 2) Fetch SHIFT details by calling our own /winteam/shifts and filtering by cellId
+  // --- Fetch SHIFT by calling our own /winteam/shifts and filtering by cellId
   let shift = null;
-+  // --- 2) Fetch SHIFT details by calling our own /winteam/shifts and filtering by cellId
-+  // Use the helper that actually exists: fetchShiftByCellIdViaSelf
-+  let shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }).catch(()=>null);
-+  // If a dateHint was provided but the narrow search missed, retry without the hint (wider 15-day window).
-+  if (!shift && dateHint) {
-+    try {
-+      console.log("ZVA DEBUG writer: no hit with dateHint; retrying without dateHint", { employeeNumber, cellId, dateHint });
-+      shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint: "" });
-+    } catch (e) {
-+      console.log("ZVA DEBUG writer: retry fetch without dateHint threw", String(e && e.message || e));
-+    }
-+  }
-+  if (!shift) {
-+    console.log("ZVA DEBUG writer: Shift not found by cellId in either attempt", { employeeNumber, cellId, dateHint });
-+    return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
-+  }
+  try {
+    shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint });
+  } catch (e) {
+    console.log("ZVA DEBUG writer: first fetch by cellId threw", String(e && e.message || e));
+  }
+
+  // If we had a dateHint but didn’t find it, retry without the hint (wider 15-day window)
+  if (!shift && dateHint) {
+    try {
+      console.log("ZVA DEBUG writer: no hit with dateHint; retrying without dateHint", { employeeNumber, cellId, dateHint });
+      shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint: "" });
+    } catch (e) {
+      console.log("ZVA DEBUG writer: retry without dateHint threw", String(e && e.message || e));
+    }
+  }
+
+  if (!shift) {
+    console.log("ZVA DEBUG writer: Shift not found by cellId in either attempt", { employeeNumber, cellId, dateHint });
+    return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
+  }
 
   const site     = (shift.site || shift.siteName || "").toString().trim();
   const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
@@ -790,26 +804,27 @@ async function handleZvaShiftWriteByCell(req, env) {
   const itemName = `${employeeNumber || "unknown"} | ${fullName || "Unknown Caller"}`;
   const dateKey  = startISO ? startISO.slice(0,10) : "date?";
   const dedupeKey = engagementId || [employeeNumber || "emp?", site || "site?", dateKey].join("|");
-  const callerId = normPhone(aniRaw);
 
   const mondayBody = { itemName, dedupeKey };
-  if (site)       mondayBody.accountSite = site;
-  if (startISO)   mondayBody.shiftStart  = startISO;
-  if (endISO)     mondayBody.shiftEnd    = endISO;
-  if (callerId)   mondayBody.callerId    = callerId;
-  if (reason)     mondayBody.reason      = reason;
+  if (site)        mondayBody.accountSite = site;
+  if (startISO)    mondayBody.shiftStart  = startISO;
+  if (endISO)      mondayBody.shiftEnd    = endISO;
+  if (callerId)    mondayBody.callerId    = callerId;
+  if (reason)      mondayBody.reason      = reason;
   if (engagementId) mondayBody.engagementId = engagementId;
 
-  let mResp, mData;
+  // Forward to our /monday/write
+  let mData = null;
   try {
-    mResp = await fetch(`${origin}/monday/write`, {
+    const mResp = await fetch(`${origin}/monday/write`, {
       method: "POST",
       headers: { "content-type":"application/json" },
       body: JSON.stringify(mondayBody)
     });
     mData = await mResp.json();
   } catch (e) {
-    return json({ success:false, message:`Monday write failed: ${e?.message||e}` }, { status:502 });
+    console.log("ZVA DEBUG writer: Monday write threw", String(e && e.message || e));
+    return json({ success:false, message:`Monday write failed: ${e?.message || e}` }, { status:502 });
   }
 
   return json({
