@@ -4,11 +4,12 @@ main = "_worker.js"
 compatibility_date = "2025-10-18"
 workers_dev = true
 
-# Optional: if you plan to use KV idempotency
-# [[kv_namespaces]]
-# binding = "FLOW_GUARD"
-# id = "your_kv_namespace_id"
+[observability]
+enabled = false
+head_sampling_rate = 1
 
-# Optional: inline default board id
-# [vars]
-# MONDAY_DEFAULT_BOARD_ID = "9729411524"
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+persist = true
+invocation_logs = true
