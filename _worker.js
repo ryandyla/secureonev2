@@ -897,20 +897,42 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
   // DEBUG: show what we’re about to request
   console.log("ZVA DEBUG fetchByCell: want cellId=", want, " dateHint=", dateHint || "(none)", " reqBody=", JSON.stringify(body));
 
-  const r = await fetch(`${origin}/winteam/shifts`, {
+  let r;
+  try {
+    r = await fetch(`${origin}/winteam/shifts`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   });
-
-  let j;
-  try {
-    j = await r.json();
   } catch (e) {
-    console.log("ZVA DEBUG fetchByCell: failed to parse JSON:", String(e));
+    console.log("ZVA DEBUG fetchByCell: request failed", { error: String(e) });
     return null;
   }
 
+  if (!r.ok) {
+    const raw = await r.text().catch(() => "");
+    console.log("ZVA DEBUG fetchByCell: non-OK response", {
+      status: r.status,
+      ct: r.headers.get("content-type") || "",
+      body: raw.slice(0, 300)
+    });
+    return null;
+  }
+
+  const ct = r.headers.get("content-type") || "";
+  const raw = await r.text().catch(() => "");
+  let j;
+  try {
+    j = /json/i.test(ct) ? JSON.parse(raw) : JSON.parse(raw);
+  } catch (e) {
+    console.log("ZVA DEBUG fetchByCell: failed to parse JSON", {
+      status: r.status,
+      ct,
+      err: String(e),
+      body: raw.slice(0, 300)
+    });
+    return null;
+  }
   // Prefer full list; fallback to page list
   const arr = Array.isArray(j?.entries) ? j.entries
             : Array.isArray(j?.entries_page) ? j.entries_page
