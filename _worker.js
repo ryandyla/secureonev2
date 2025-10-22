@@ -574,7 +574,7 @@ function buildMondayColumnsFromFriendly(body) {
 
   // 6) DEPARTMENT
   const explicitDept = String(body.department || "").trim();
-  const dept = explicitDept || deriveDepartmentFromReason(body.reason || "");
+  const dept = explicitDept || deriveDepartmentFromReason(body.callreason || "");
   if (dept) out[MONDAY_COLUMN_MAP.department] = mondayStatusLabel(dept);
 
   // Remove undefined
@@ -704,7 +704,7 @@ async function handleZvaShiftWrite(req, env) {
 
   const employeeNumber = String(body.employeeNumber || "").trim();
   const selectionIndex = Number(body.selectionIndex ?? 0) || 0;
-  const reason         = (body.reason ?? "calling off sick").toString().trim();
+  const reason         = (body.callreason ?? "calling off sick").toString().trim();
   const ani            = (body.ani || "").toString().trim();
   const engagementId   = (body.engagementId || "").toString().trim();
   const pageStart      = Number(body.pageStart ?? 0) || 0;
@@ -762,7 +762,7 @@ async function handleZvaShiftWrite(req, env) {
   if (startISO)   mondayBody.shiftStart  = startISO;
   if (endISO)     mondayBody.shiftEnd    = endISO;
   if (callerId)   mondayBody.callerId    = callerId;
-  if (reason)     mondayBody.reason      = reason;
+  if (reason)     mondayBody.callreason  = reason;
   if (engagementId) mondayBody.engagementId = engagementId;
 
   let mResp, mData;
@@ -843,7 +843,7 @@ async function handleZvaShiftWriteByCell(req, env) {
 
   const employeeNumber = String(body.employeeNumber || "").trim();
   const cellId         = String(body.cellId ?? body.selectedCellId ?? "").trim();
-  const reason         = String(body.reason || "calling off sick").trim();
+  const reason         = String(body.callreason || "calling off sick").trim();
   const aniRaw         = String(body.ani || "").trim();
   const engagementId   = String(body.engagementId || "").trim();
   const dateHint       = String(body.dateHint || "").trim(); // optional: "YYYY-MM-DD"
