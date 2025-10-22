@@ -748,6 +748,7 @@ async function handleZvaShiftWriteByCell(req, env) {
   const reason         = String(body.reason || "calling off sick").trim();
   const aniRaw         = String(body.ani || "").trim();
   const engagementId   = String(body.engagementId || "").trim();
+  const dateHint       = String(body.dateHint || "").trim(); // optional: "YYYY-MM-DD"
 
   if (!employeeNumber) return json({ success:false, message:"employeeNumber required" }, { status:400 });
   if (!cellId)         return json({ success:false, message:"cellId required" }, { status:400 });
@@ -768,7 +769,8 @@ async function handleZvaShiftWriteByCell(req, env) {
   const employee = await fetchEmployeeDetail(employeeNumber, env).catch(()=>null);
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
-  const shift    = await fetchShiftByCellId(employeeNumber, cellId, env).catch(()=>null);
+  // --- 2) Fetch SHIFT details by calling our own /winteam/shifts and filtering by cellId
+  const shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }).catch(()=>null);
   if (!shift) return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
 
   const site     = (shift.site || shift.siteName || "").toString().trim();
@@ -874,6 +876,57 @@ async function fetchShiftByCellId(employeeNumber, cellId, env) {
   }
   return null; // not found in the window
 }
+
+// Look up a single shift by cellId by calling our own /winteam/shifts and filtering.
+async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }) {
+  const origin = new URL(req.url).origin;
+  const want = String(cellId || "").trim();
+  if (!want) return null;
+
+  // If you can pass a date from ZVA, it greatly narrows the search.
+  // We'll use [dateHint, dateHint+1] if provided; else let the worker's 15-day window apply.
+  const body = { employeeNumber };
+  if (dateHint) {
+    try {
+      const d = new Date(dateHint);
+      if (!isNaN(d)) {
+        const ymd = (x)=>x.toISOString().slice(0,10);
+        const to  = new Date(d.getTime() + 24*60*60*1000);
+        body.dateFrom = ymd(d);
+        body.dateTo   = ymd(to);
+      }
+    } catch {}
+  }
+
+  const r = await fetch(`${origin}/winteam/shifts`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json();
+
+  // Prefer full list; fallback to page list
+  const arr = Array.isArray(j?.entries) ? j.entries
+            : Array.isArray(j?.entries_page) ? j.entries_page
+            : [];
+
+  // Find matching cellId (string-safe), falling back to scheduleDetailID if needed
+  const hit = arr.find(e => {
+    const have = String(e.cellId ?? e.id ?? e.scheduleDetailID ?? "").trim();
+    return have && have === want;
+  });
+  if (!hit) return null;
+
+  // Normalize what the writer needs
+  return {
+    cellId: String(hit.cellId ?? hit.id ?? hit.scheduleDetailID ?? "").trim(),
+    site: String(hit.site || hit.siteName || "").trim(),
+    siteName: String(hit.site || hit.siteName || "").trim(),
+    startLocalISO: String(hit.startLocalISO || hit.startIso || "").trim(),
+    endLocalISO:   String(hit.endLocalISO   || hit.endIso   || "").trim()
+  };
+}
+
 
 ///////////////////////////////
 // Router (module syntax, single export)
