@@ -356,14 +356,23 @@ async function handleAuthEmployee(req, env) {
 }
 
 async function handleShifts(req, env) {
-  const body = await readJson(req);
-  if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
+  let body = {};
+  try { body = await request.json(); } catch {}
 
-  const employeeNumber = trim(body.employeeNumber);
-  const pageStart = Number(trim(body.pageStart ?? "0")) || 0;
-  if (!employeeNumber) {
-    return json({ success: false, message: "employeeNumber is required." }, { status: 400 });
+  if (body && typeof body === "object") {
+    if (body.params && typeof body.params === "object") body = body.params; // <-- unwrap
+    else if (body.json && typeof body.json === "object") body = body.json;   // axios-style
+    else if (body.data && typeof body.data === "object") body = body.data;   // alt-form
   }
+
+const employeeNumber = String(body.employeeNumber || "").trim();
+const pageStart = Number(body.pageStart ?? 0) || 0;
+const dateFrom  = (body.dateFrom || "").toString().trim(); // YYYY-MM-DD (optional)
+const dateTo    = (body.dateTo   || "").toString().trim(); // YYYY-MM-DD (optional)
+
+if (!employeeNumber) {
+  return json({ success:false, message:"employeeNumber is required." }, { status:400 });
+}
 
   // Always ask WinTeam for a 15-day window
   const startBase = nowAnchor();
@@ -616,6 +625,108 @@ function buildMondayColumnsFromFriendly(body) {
     out[MONDAY_COLUMN_MAP.department] = mondayStatusLabel(dept);
   }
 
+  // Router add:
+if (request.method === "POST" && url.pathname === "/zva/shift-write-by-cell") {
+  return handleZvaShiftWriteByCell(request);
+}
+
+async function handleZvaShiftWriteByCell(request) {
+  let body = {};
+  try { body = await request.json(); } catch {}
+  if (body?.json && typeof body.json === "object") body = body.json;
+  if (body?.data && typeof body.data === "object") body = body.data;
+
+  const employeeNumber = String(body.employeeNumber || "").trim();
+  const cellId         = String(body.cellId || "").trim();
+  const reason         = String(body.reason || "calling off sick").trim();
+  const aniRaw         = String(body.ani || "").trim();
+  const engagementId   = String(body.engagementId || "").trim();
+
+  if (!employeeNumber) return json({ success:false, message:"employeeNumber required" }, { status:400 });
+  if (!cellId)         return json({ success:false, message:"cellId required" }, { status:400 });
+
+  // Helpers
+  const origin = new URL(request.url).origin;
+  const normPhone = (raw)=> {
+    if (!raw) return "";
+    const s=String(raw);
+    const e=s.trim().startsWith("+")?s.replace(/[^\+\d]/g,""):null;
+    const d=s.replace(/\D+/g,"");
+    if (e && /^\+\d{8,15}$/.test(e)) return e;
+    if (d.length===11 && d[0]==="1") return "+"+d;
+    if (d.length===10) return "+1"+d;
+    return "";
+  };
+
+  // --- 1) Fetch EMPLOYEE details (name, maybe state/division if needed)
+  // Replace these stubs with your existing internal functions/calls:
+  const employee = await fetchEmployeeDetail(employeeNumber).catch(()=>null); // { fullName, workstate?, ... }
+  const fullName = (employee?.fullName || employee?.name || "").toString().trim();
+
+  // --- 2) Fetch SHIFT details by cellId
+  const shift = await fetchShiftByCellId(employeeNumber, cellId).catch(()=>null);
+  if (!shift) return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
+
+  const site     = (shift.site || shift.siteName || "").toString().trim();
+  const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
+  const endISO   = (shift.endLocalISO   || shift.endIso   || "").toString().trim();
+
+  // --- 3) Build Monday write payload
+  const itemName = `${employeeNumber || "unknown"} | ${fullName || "Unknown Caller"}`;
+  const dateKey  = startISO ? startISO.slice(0,10) : "date?";
+  const dedupeKey = engagementId || [employeeNumber || "emp?", site || "site?", dateKey].join("|");
+  const callerId = normPhone(aniRaw);
+
+  const mondayBody = { itemName, dedupeKey };
+  if (site)       mondayBody.accountSite = site;
+  if (startISO)   mondayBody.shiftStart  = startISO;
+  if (endISO)     mondayBody.shiftEnd    = endISO;
+  if (callerId)   mondayBody.callerId    = callerId;
+  if (reason)     mondayBody.reason      = reason;
+  if (engagementId) mondayBody.engagementId = engagementId;
+
+  // --- 4) Call existing /monday/write
+  let mResp, mData;
+  try {
+    mResp = await fetch(`${origin}/monday/write`, {
+      method: "POST",
+      headers: { "content-type":"application/json" },
+      body: JSON.stringify(mondayBody)
+    });
+    mData = await mResp.json();
+  } catch (e) {
+    return json({ success:false, message:`Monday write failed: ${e?.message||e}` }, { status:502 });
+  }
+
+  return json({
+    success: !!mData?.success,
+    message: mData?.message || "Done.",
+    sent: { employeeNumber, cellId, site, startISO, endISO, reason, callerId, engagementId, itemName, dedupeKey },
+    monday: mData
+  }, { status: mData?.success ? 200 : 500 });
+}
+
+// ---- Stub helpers: replace with your existing WinTeam client ----
+async function fetchEmployeeDetail(employeeNumber) {
+  // e.g., call your internal winteam auth + /employee endpoint
+  // return { fullName: "RONALD CLARK", workstate: "IL" };
+  return {};
+}
+async function fetchShiftByCellId(employeeNumber, cellId) {
+  // e.g., call WinTeam "schedule cell" endpoint or filter your cached list
+  // MUST return: { site|siteName, startLocalISO|startIso, endLocalISO|endIso, ... }
+  return null;
+}
+
+function json(obj, init) {
+  return new Response(JSON.stringify(obj), {
+    headers: { "content-type":"application/json; charset=utf-8" },
+    ...(init||{})
+  });
+}
+
+
+  
   // Remove undefined
   for (const k of Object.keys(out)) { if (out[k] === undefined) delete out[k]; }
   return out;
