@@ -847,6 +847,7 @@ async function handleZvaShiftWriteByCell(req, env) {
   const aniRaw         = String(body.ani || "").trim();
   const engagementId   = String(body.engagementId || "").trim();
   const dateHint       = String(body.dateHint || "").trim(); // optional: "YYYY-MM-DD"
+  const ofctimeinorout = String(body.ofctimeinorout || "").trim(); // optional: time in or out if given
 
   if (!employeeNumber) return json({ success:false, message:"employeeNumber required" }, { status:400 });
   if (!cellId)         return json({ success:false, message:"cellId required" }, { status:400 });
@@ -939,6 +940,7 @@ async function handleZvaShiftWriteByCell(req, env) {
     callerId,                     // phone_mkv0p9q3  (E.164 if possible)
     startTime: startNice,          // text_mkv0t29z
     endTime: endNice,              // text_mkv0nmq1
+    timeinorout: ofctimeinorout,    // text_mktsvsns
     zoomGuid: engagementId || "", // text_mkv7j2fq
     // nice one-liner summary:
     shift: `${startNice} → ${endNice} @ ${site || ""}`.trim(),
