@@ -418,8 +418,8 @@ async function handleShifts(req, env) {
       const speakLine = `${weekdayMonthDay(startLocal)}, ${fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes())}`
         + ` to ${weekdayMonthDay(endLocal)} ${fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes())}`
         + (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
-
-      const cellId = String(s.scheduleDetailID ?? s.cellId ?? "").trim(); // ensure cellId present
+      const cellId = String(s.cellId ?? "").trim();
+      const scheduleDetailID = String(s.scheduleDetailID ?? "").trim();
 
       rows.push({
         employeeNumber: trim(r.employeeNumber || employeeNumber),
@@ -427,9 +427,9 @@ async function handleShifts(req, env) {
         hours: s.hours,
         hourType: trim(s.hourType),
         hourDescription: trim(s.hourDescription),
-        scheduleDetailID: s.scheduleDetailID,
-        cellId,
-        id: cellId,
+        cellId,                    // unique ID you want to use
+        scheduleDetailID,          // keep for reference; NOT used for identity
+        id: cellId,                // keep alias if you rely on id elsewhere
         startLocalISO: startLocal.toISOString(),
         endLocalISO:   endLocal.toISOString(),
         concise, speakLine
@@ -474,7 +474,7 @@ async function handleShifts(req, env) {
 
   const speakable_page = pageRows.map(r => r.speakLine);
   const entries_page = pageRows.map(({employeeNumber, site, role, startLocalISO, endLocalISO, hours, concise, hourType, hourDescription, scheduleDetailID, cellId, id}) => ({
-    employeeNumber, site, role, startLocalISO, endLocalISO, hours, concise, hourType, hourDescription, scheduleDetailID, cellId, id
+    employeeNumber, site, role, startLocalISO, endLocalISO, hours, concise, hourType, hourDescription, cellId, scheduleDetailID, id
   }));
 
   return json({
@@ -662,6 +662,8 @@ async function handleZvaShiftWrite(req, env) {
   const ani            = (body.ani || "").toString().trim();
   const engagementId   = (body.engagementId || "").toString().trim();
   const pageStart      = Number(body.pageStart ?? 0) || 0;
+  // added for consistency in case we decide to call this endpoint again, cell ID is piped in
+  const cellId = String(body.cellId ?? body.selectedCellId ?? "").trim();
 
   if (!employeeNumber) {
     return json({ success:false, message:"employeeNumber required" }, { status:400 });
@@ -744,7 +746,7 @@ async function handleZvaShiftWriteByCell(req, env) {
   if (body?.data && typeof body.data === "object") body = body.data;
 
   const employeeNumber = String(body.employeeNumber || "").trim();
-  const cellId         = String(body.cellId || "").trim();
+  const cellId         = String(body.cellId ?? body.selectedCellId ?? "").trim();
   const reason         = String(body.reason || "calling off sick").trim();
   const aniRaw         = String(body.ani || "").trim();
   const engagementId   = String(body.engagementId || "").trim();
@@ -911,12 +913,10 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
             : [];
 
   // Find matching cellId (string-safe), falling back to scheduleDetailID if needed
-  const hit = arr.find(e => {
-    const have = String(e.cellId ?? e.id ?? e.scheduleDetailID ?? "").trim();
-    return have && have === want;
+  const hit = arr.find(e => String(e?.cellId || "").trim() === want);
   });
   if (!hit) return null;
-
+  
   // Normalize what the writer needs
   return {
     cellId: String(hit.cellId ?? hit.id ?? hit.scheduleDetailID ?? "").trim(),
