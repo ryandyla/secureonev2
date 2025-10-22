@@ -885,14 +885,14 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
   const want = String(cellId || "").trim();
   if (!want) return null;
 
-  // Prefer a tight [dateHint, dateHint+1) window if provided; else let /winteam/shifts default (now→now+15d).
+  // If ZVA can send a date, narrow to [dateHint, dateHint+1)
   const body = { employeeNumber };
   if (dateHint) {
     try {
       const d = new Date(dateHint);
       if (!isNaN(d)) {
-        const ymd = (x)=>x.toISOString().slice(0,10);
-        const to  = new Date(d.getTime() + 24*60*60*1000);
+        const ymd = (x) => x.toISOString().slice(0, 10);
+        const to  = new Date(d.getTime() + 24 * 60 * 60 * 1000);
         body.dateFrom = ymd(d);
         body.dateTo   = ymd(to);
       }
@@ -906,30 +906,24 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
   });
   const j = await r.json();
 
- const arr = Array.isArray(j?.entries) ? j.entries
-          : Array.isArray(j?.entries_page) ? j.entries_page
-          : [];
+  // Prefer full list; fallback to page list
+  const arr = Array.isArray(j?.entries) ? j.entries
+            : Array.isArray(j?.entries_page) ? j.entries_page
+            : [];
 
-const want = String(cellId || "").trim();
-const hit = arr.find(e => String(e?.cellId ?? "").trim() === want);
-if (!hit) {
-  console.log("cellId not found; sample ids:", arr.slice(0,30).map(x => x?.cellId).filter(Boolean));
-  return null;
-}
-
-    return null;
-  }
+  // STRICT: only compare e.cellId
+  const hit = arr.find(e => String(e?.cellId ?? "").trim() === want);
+  if (!hit) return null;
 
   // Normalize what the writer needs
   return {
-    cellId: norm(hit.cellId),
-    site: norm(hit.site || hit.siteName),
-    siteName: norm(hit.site || hit.siteName),
-    startLocalISO: norm(hit.startLocalISO || hit.startIso),
-    endLocalISO:   norm(hit.endLocalISO   || hit.endIso)
+    cellId: String(hit.cellId).trim(),
+    site: String(hit.site || hit.siteName || "").trim(),
+    siteName: String(hit.site || hit.siteName || "").trim(),
+    startLocalISO: String(hit.startLocalISO || hit.startIso || "").trim(),
+    endLocalISO:   String(hit.endLocalISO   || hit.endIso   || "").trim()
   };
 }
-
 
 
 ///////////////////////////////
