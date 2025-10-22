@@ -912,11 +912,10 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
             : Array.isArray(j?.entries_page) ? j.entries_page
             : [];
 
-  // Find matching cellId (string-safe), falling back to scheduleDetailID if needed
+  // Find matching cellId (string-safe)
   const hit = arr.find(e => String(e?.cellId || "").trim() === want);
-  });
   if (!hit) return null;
-  
+
   // Normalize what the writer needs
   return {
     cellId: String(hit.cellId ?? hit.id ?? hit.scheduleDetailID ?? "").trim(),
