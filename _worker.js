@@ -69,6 +69,18 @@ function ymd(date) {
   const d = pad2(date.getUTCDate());
   return `${y}-${m}-${d}`;
 }
+
+function fmtYmdHmUTC(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const y = d.getUTCFullYear();
+  const m = pad2(d.getUTCMonth() + 1);
+  const day = pad2(d.getUTCDate());
+  const hh = pad2(d.getUTCHours());
+  const mm = pad2(d.getUTCMinutes());
+  return `${y}-${m}-${day} ${hh}:${mm}`;
+}
+
 function addDaysUTC(date, days) {
   const d = new Date(date.getTime());
   d.setUTCDate(d.getUTCDate() + days);
@@ -297,12 +309,21 @@ function stateFromSupervisor(supervisorDescription = "") {
 }
 
 function deriveDepartmentFromReason(reasonRaw = "") {
-  const r = String(reasonRaw).toLowerCase();
-  if (/\b(payroll|pay\s*issue|pay\s*check|pay\s*stub|w2|w-?2|tax|withhold)/i.test(r)) return "Payroll";
-  if (/\b(training|train|course|lms|cert|certificate|guard\s*card)/i.test(r)) return "Training";
-  if (/\b(call\s*off|calloff|no\s*show|incident|report|time\s*card|timecard|punch|missed\s*punch|late|coverage|schedule)/i.test(r)) return "Operations";
+  // Keep it simple: match *phrases* you care about.
+  // Note: we use /i so no need to lower-case first.
+  if (/\b(payroll|pay\s*issue|pay\s*check|pay\s*stub|w-?2|tax|withhold)\b/i.test(reasonRaw)) {
+    return "Payroll";
+  }
+  if (/\b(training|train|course|lms|cert(ificate)?|guard\s*card)\b/i.test(reasonRaw)) {
+    return "Training";
+  }
+  // Expanded coverage for ops-y reasons:
+  if (/\b(call(?:ing)?[-\s]*off|callout|no[-\s]*show|coverage|cover|late|tardy|time\s*card|timecard|punch|missed\s*punch|schedule|swap|shift\s*change|sick|pto|absence|absent)\b/i.test(reasonRaw)) {
+    return "Operations";
+  }
   return "Other";
 }
+
 
 function mondayStatusLabel(label) {
   const v = String(label || "").trim();
@@ -908,16 +929,19 @@ async function handleZvaShiftWriteByCell(req, env) {
   //  - Auto-derive Division from supervisorDescription only if we don’t supply it
   //  - Parse dateTime strings into Monday’s date/time JSON
   const nowISO = new Date().toISOString();
+
+  const startNice = fmtYmdHmUTC(startISO); // "2025-10-22 23:00"
+  const endNice   = fmtYmdHmUTC(endISO);   // "2025-10-23 07:00"
   
   const cvFriendly = {
     site,                         // text_mktj4gmt
     reason,                       // text_mktdb8pg
     callerId,                     // phone_mkv0p9q3  (E.164 if possible)
-    startTime: startISO,          // text_mkv0t29z
-    endTime: endISO,              // text_mkv0nmq1
+    startTime: startNice,          // text_mkv0t29z
+    endTime: endNice,              // text_mkv0nmq1
     zoomGuid: engagementId || "", // text_mkv7j2fq
     // nice one-liner summary:
-    shift: `${(startISO||"").slice(0,16)} → ${(endISO||"").slice(11,16)} @ ${site || ""}`.trim(),
+    shift: `${startNice} → ${endNice} @ ${site || ""}`.trim(),
   
     // New bits:
     division,                     // color_mktd81zp (Status)
