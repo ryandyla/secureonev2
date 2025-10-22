@@ -744,7 +744,7 @@ async function handleZvaShiftWriteByCell(req, env) {
   const reason         = String(body.reason || "calling off sick").trim();
   const aniRaw         = String(body.ani || "").trim();
   const engagementId   = String(body.engagementId || "").trim();
-  const dateHint       = String(body.dateHint || "").trim(); // optional: "YYYY-MM-DD"
+  const dateHint       = String(body.dateHint || "").trim();
 
   if (!employeeNumber) return json({ success:false, message:"employeeNumber required" }, { status:400 });
   if (!cellId)         return json({ success:false, message:"cellId required" }, { status:400 });
@@ -761,11 +761,9 @@ async function handleZvaShiftWriteByCell(req, env) {
     if (d.length === 10) return "+1" + d;
     return "";
   };
-
-  // Caller identity (optional)
   const callerId = normPhone(aniRaw);
 
-  // Pull basic employee info (best-effort)
+  // Best-effort employee info
   let employee = null;
   try {
     employee = await fetchEmployeeDetail(employeeNumber, env);
@@ -774,26 +772,37 @@ async function handleZvaShiftWriteByCell(req, env) {
   }
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
-  // --- Fetch SHIFT by calling our own /winteam/shifts and filtering by cellId
+  // 1) Try via self with dateHint
   let shift = null;
   try {
     shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint });
   } catch (e) {
-    console.log("ZVA DEBUG writer: first fetch by cellId threw", String(e && e.message || e));
+    console.log("ZVA DEBUG writer: viaSelf w/dateHint threw", String(e && e.message || e));
   }
 
-  // If we had a dateHint but didn’t find it, retry without the hint (wider 15-day window)
+  // 2) If that failed and we had a dateHint, retry via self without it
   if (!shift && dateHint) {
+    console.log("ZVA DEBUG writer: no hit with dateHint; retrying without dateHint", { employeeNumber, cellId, dateHint });
     try {
-      console.log("ZVA DEBUG writer: no hit with dateHint; retrying without dateHint", { employeeNumber, cellId, dateHint });
       shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint: "" });
     } catch (e) {
-      console.log("ZVA DEBUG writer: retry without dateHint threw", String(e && e.message || e));
+      console.log("ZVA DEBUG writer: viaSelf retry threw", String(e && e.message || e));
+    }
+  }
+
+  // 3) If still no hit, do a wide direct WinTeam lookup
+  if (!shift) {
+    try {
+      console.log("ZVA DEBUG writer: falling back to wide WinTeam window for cellId", { employeeNumber, cellId });
+      shift = await fetchShiftByCellId(employeeNumber, cellId, env);
+      if (shift) console.log("ZVA DEBUG writer: wide WinTeam lookup succeeded", { found: true, cellId: shift.cellId });
+    } catch (e) {
+      console.log("ZVA DEBUG writer: wide WinTeam lookup threw", String(e && e.message || e));
     }
   }
 
   if (!shift) {
-    console.log("ZVA DEBUG writer: Shift not found by cellId in either attempt", { employeeNumber, cellId, dateHint });
+    console.log("ZVA DEBUG writer: Shift not found by cellId after all attempts", { employeeNumber, cellId, dateHint });
     return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
   }
 
@@ -813,7 +822,6 @@ async function handleZvaShiftWriteByCell(req, env) {
   if (reason)      mondayBody.reason      = reason;
   if (engagementId) mondayBody.engagementId = engagementId;
 
-  // Forward to our /monday/write
   let mData = null;
   try {
     const mResp = await fetch(`${origin}/monday/write`, {
@@ -835,151 +843,64 @@ async function handleZvaShiftWriteByCell(req, env) {
   }, { status: mData?.success ? 200 : 500 });
 }
 
-// ---- Winteam Helpers
-async function fetchEmployeeDetail(employeeNumber, env) {
-  const url = buildEmployeeURL(employeeNumber);
-  const wt = await callWinTeamJSON(url, env);
-  if (!wt.ok) throw new Error(`WinTeam employees failed (${wt.status}) ${wt.error||""}`);
-
-  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
-  const results = Array.isArray(page?.results) ? page.results : [];
-  const e = results[0];
-  if (!e) return null;
-  return {
-    fullName: [trim(e.firstName), trim(e.lastName)].filter(Boolean).join(" "),
-    workstate: trim(e.state || e.workState || ""),
-    supervisorDescription: trim(e.supervisorDescription || "")
-  };
-}
-/**
- * Fetch a single shift by cellId (aka scheduleDetailID) for an employee.
- * Uses a wide window so we don’t miss past/future dates.
- */
-async function fetchShiftByCellId(employeeNumber, cellId, env) {
-  const norm = (v) => String(v ?? "").trim();
-  const want = norm(cellId);
-
-  // Search a reasonably-wide window (past 60d → next 90d)
-  const now = new Date();
-  const fromDate = ymd(addDaysUTC(now, -60));
-  const toDate   = ymd(addDaysUTC(now,  90));
-
-  const url = new URL(SHIFTS_BASE_EXACT);
-  url.searchParams.set("employeeNumber", String(employeeNumber));
-  url.searchParams.set("fromDate", fromDate);
-  url.searchParams.set("toDate", toDate);
-
-  const wt = await callWinTeamJSON(url.toString(), env);
-  if (!wt.ok) throw new Error(`WinTeam shiftDetails failed (${wt.status}) ${wt.error||""}`);
-
-  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
-  const results = Array.isArray(page?.results) ? page.results : [];
-
-  for (const r of results) {
-    const siteName = trim(r.jobDescription);
-    const roleName = trim(r.postDescription);
-    const shifts = Array.isArray(r.shifts) ? r.shifts : [];
-    for (const s of shifts) {
-      const have = norm(s.scheduleDetailID ?? s.cellId);
-      if (have && have === want) {
-        // Build normalized shape the writer expects
-        const startLocal = parseNaiveAsLocalWall(s.startTime);
-        let   endLocal   = parseNaiveAsLocalWall(s.endTime);
-        if (startLocal && endLocal && endLocal.getTime() <= startLocal.getTime()) {
-          endLocal = new Date(endLocal.getTime() + 24*60*60*1000); // overnight
-        }
-        return {
-          cellId: have,
-          site: siteName,
-          siteName,
-          role: roleName,
-          startLocalISO: startLocal ? startLocal.toISOString() : "",
-          endLocalISO:   endLocal   ? endLocal.toISOString()   : ""
-        };
-      }
-    }
-  }
-  return null; // not found in the window
-}
-
 // Look up a single shift by cellId by calling our own /winteam/shifts and filtering.
 async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }) {
   const origin = new URL(req.url).origin;
   const want = String(cellId || "").trim();
   if (!want) return null;
 
-  // Build request to /winteam/shifts (optionally narrowed by dateHint)
-  const body = { employeeNumber: String(employeeNumber || "").trim() };
-  let dr = null;
+  const body = { employeeNumber };
   if (dateHint) {
     try {
       const d = new Date(dateHint);
       if (!isNaN(d)) {
-        const toYmd = (x) => x.toISOString().slice(0, 10);
-        const to    = new Date(d.getTime() + 24*60*60*1000);
-        body.dateFrom = toYmd(d);
-        body.dateTo   = toYmd(to);
-        dr = `${body.dateFrom}→${body.dateTo}`;
+        const ymd = (x) => x.toISOString().slice(0, 10);
+        const to  = new Date(d.getTime() + 24 * 60 * 60 * 1000);
+        body.dateFrom = ymd(d);
+        body.dateTo   = ymd(to);
       }
     } catch {}
   }
 
-  // DEBUG: show what we’re about to request
-  console.log("ZVA DEBUG fetchByCell: want cellId=", want, " dateHint=", dateHint || "(none)", " reqBody=", JSON.stringify(body));
-
-  let r;
-  try {
-    r = await fetch(`${origin}/winteam/shifts`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body)
-  });
-  } catch (e) {
-    console.log("ZVA DEBUG fetchByCell: request failed", { error: String(e) });
-    return null;
-  }
-
-  if (!r.ok) {
-    const raw = await r.text().catch(() => "");
-    console.log("ZVA DEBUG fetchByCell: non-OK response", {
-      status: r.status,
-      ct: r.headers.get("content-type") || "",
-      body: raw.slice(0, 300)
-    });
-    return null;
-  }
-
-  const ct = r.headers.get("content-type") || "";
-  const raw = await r.text().catch(() => "");
   let j;
   try {
-    j = /json/i.test(ct) ? JSON.parse(raw) : JSON.parse(raw);
-  } catch (e) {
-    console.log("ZVA DEBUG fetchByCell: failed to parse JSON", {
-      status: r.status,
-      ct,
-      err: String(e),
-      body: raw.slice(0, 300)
+    const r = await fetch(`${origin}/winteam/shifts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
     });
+
+    const ct = r.headers.get("content-type") || "";
+    const text = await r.text();
+    try {
+      j = /json/i.test(ct) ? JSON.parse(text) : JSON.parse(text); // try anyway
+    } catch (e) {
+      console.log("ZVA DEBUG viaSelf: failed to parse JSON", { status: r.status, ct, snippet: text.slice(0, 120) });
+      return null;
+    }
+  } catch (e) {
+    console.log("ZVA DEBUG viaSelf: fetch to /winteam/shifts threw", String(e && e.message || e));
     return null;
   }
-  // Prefer full list; fallback to page list
-  const arr = Array.isArray(j?.entries) ? j.entries
-            : Array.isArray(j?.entries_page) ? j.entries_page
-            : [];
 
-  // DEBUG: show the cellIds we actually saw
-  const seen = arr.map(e => String(e?.cellId ?? e?.id ?? e?.scheduleDetailID ?? "")).filter(Boolean);
-  console.log("ZVA DEBUG fetchByCell: window=", dr || j?.window || "(default)", " count=", arr.length, " seenCellIds=", seen);
+  const entries = Array.isArray(j?.entries) ? j.entries : [];
+  const pageEntries = Array.isArray(j?.entries_page) ? j.entries_page : [];
+  const arr = entries.length ? entries : pageEntries;
 
-  // STRICT: only compare against the real cellId field
+  // Debug: log what IDs we actually saw
+  const ids = arr.map(e => String(e?.cellId ?? "")).filter(Boolean);
+  console.log("ZVA DEBUG viaSelf: received", {
+    employeeNumber,
+    dateHint: dateHint || "",
+    count: arr.length,
+    sampleIds: ids.slice(0, 8),
+    want
+  });
+
+  // Strict: match only by cellId
   const hit = arr.find(e => String(e?.cellId ?? "").trim() === want);
-
-  console.log("ZVA DEBUG fetchByCell: match", hit ? "FOUND" : "NOT FOUND");
-
   if (!hit) return null;
 
-  // Normalize what the writer needs
   return {
     cellId: String(hit.cellId).trim(),
     site: String(hit.site || hit.siteName || "").trim(),
