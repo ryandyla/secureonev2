@@ -765,8 +765,18 @@ async function handleZvaShiftWriteByCell(req, env) {
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
   // --- 2) Fetch SHIFT details by calling our own /winteam/shifts and filtering by cellId
-  const shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }).catch(()=>null);
-  if (!shift) return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
+  let shift = null;
+  if (dateHint) {
+    shift = await fetchShiftByCellIdDateBound(employeeNumber, cellId, env, dateHint).catch(()=>null);
+  }
+  if (!shift) {
+    // fallback (older path via self-call)
+    shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }).catch(()=>null);
+  }
+ if (!shift) {
+   console.log("ZVA DEBUG writer: no shift match", { employeeNumber, cellId, dateHint });
+   return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
+ }
 
   const site     = (shift.site || shift.siteName || "").toString().trim();
   const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
