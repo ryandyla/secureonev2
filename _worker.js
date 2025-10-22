@@ -442,93 +442,127 @@ if (!employeeNumber) {
         concise
       });
     }
+  }async function handleShifts(req, env) {
+  // ---- Read body and unwrap common shapes ----
+  let body = await readJson(req);
+  if (!body) body = {};
+  if (body && typeof body === "object") {
+    if (body.params && typeof body.params === "object") body = body.params;
+    else if (body.json && typeof body.json === "object") body = body.json;
+    else if (body.data && typeof body.data === "object") body = body.data;
   }
 
-  // Always apply "now(local) → now+15d" window per row's utcOffset
+  const employeeNumber = trim(body.employeeNumber);
+  const pageStart = Number(body.pageStart ?? 0) || 0;
+  const dateFrom  = trim(body.dateFrom || ""); // optional YYYY-MM-DD
+  const dateTo    = trim(body.dateTo   || ""); // optional YYYY-MM-DD
+
+  if (!employeeNumber) {
+    return json({ success:false, message:"employeeNumber is required." }, { status:400 });
+  }
+
+  // ---- Pull a 15-day window from WinTeam (you can change this if you prefer server-date filters) ----
+  const startBase = nowAnchor();
+  const fromDate = ymd(startBase);
+  const toDate   = ymd(addDaysUTC(startBase, 15));
+
+  const wtUrl = new URL(SHIFTS_BASE_EXACT);
+  wtUrl.searchParams.set("employeeNumber", employeeNumber);
+  wtUrl.searchParams.set("fromDate", fromDate);
+  wtUrl.searchParams.set("toDate", toDate);
+
+  const wt = await callWinTeamJSON(wtUrl.toString(), env);
+  if (!wt.ok) {
+    return json(
+      { success: false, message: `WinTeam shiftDetails failed (${wt.status}).`, detail: wt.error },
+      { status: 502 }
+    );
+  }
+
+  // ---- Normalize rows ----
+  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
+  const results = Array.isArray(page?.results) ? page.results : [];
+
+  const rows = [];
+  for (const r of results) {
+    const site = trim(r.jobDescription);
+    const role = trim(r.postDescription);
+    const utcOffset = Number(r.utCoffset || 0);
+    const list = Array.isArray(r.shifts) ? r.shifts : [];
+    for (const s of list) {
+      const startLocal = parseNaiveAsLocalWall(s.startTime);
+      let   endLocal   = parseNaiveAsLocalWall(s.endTime);
+      if (!startLocal || !endLocal) continue;
+      if (endLocal.getTime() <= startLocal.getTime()) {
+        endLocal = new Date(endLocal.getTime() + 24*60*60*1000); // overnight roll
+      }
+
+      const concise =
+        `${ymdFromDate(startLocal)} ${pad2(startLocal.getUTCHours())}:${pad2(startLocal.getUTCMinutes())}` +
+        ` → ${pad2(endLocal.getUTCHours())}:${pad2(endLocal.getUTCMinutes())}` +
+        (site ? ` @ ${site}` : "") + (role ? ` (${role})` : "");
+
+      const speakLine = `${weekdayMonthDay(startLocal)}, ${fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes())}`
+        + ` to ${weekdayMonthDay(endLocal)} ${fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes())}`
+        + (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
+
+      const cellId = String(s.scheduleDetailID ?? s.cellId ?? "").trim(); // <<==== ensure cellId present
+
+      rows.push({
+        employeeNumber: trim(r.employeeNumber || employeeNumber),
+        site, role, utcOffset,
+        hours: s.hours,
+        hourType: trim(s.hourType),
+        hourDescription: trim(s.hourDescription),
+        scheduleDetailID: s.scheduleDetailID,
+        cellId,                               // <<==== include cellId
+        id: cellId,                           // <<==== alias for convenience
+        startLocalISO: startLocal.toISOString(),
+        endLocalISO:   endLocal.toISOString(),
+        concise, speakLine
+      });
+    }
+  }
+
+  // ---- Apply the 15d window in each row’s local frame ----
   const nowUTC = new Date();
-  const filtered = rows.filter(r => {
+  const in15d = rows.filter(r => {
     const startT = Date.parse(r.startLocalISO);
     if (isNaN(startT)) return false;
     const offset = Number(r.utcOffset || 0);
     const nowLocal = new Date(nowUTC.getTime());
     nowLocal.setUTCHours(nowLocal.getUTCHours() + offset);
-    const endLocal = new Date(nowLocal.getTime());
-    endLocal.setUTCDate(endLocal.getUTCDate() + 15);
+    const endLocal = new Date(nowLocal.getTime()); endLocal.setUTCDate(endLocal.getUTCDate() + 15);
     return startT >= nowLocal.getTime() && startT <= endLocal.getTime();
   });
 
-  // Sort by soonest start
-  filtered.sort((a, b) => Date.parse(a.startLocalISO) - Date.parse(b.startLocalISO));
+  // ---- Optional dateFrom/dateTo day-range filter (YYYY-MM-DD) ----
+  const inRange = (iso, fromYmd, toYmd) => {
+    if (!fromYmd || !toYmd || !iso) return true;
+    const d = new Date(iso); if (isNaN(d)) return false;
+    const ymd = d.toISOString().slice(0,10);
+    return (ymd >= fromYmd && ymd < toYmd);
+  };
+  let filtered = in15d;
+  if (dateFrom && dateTo) {
+    filtered = filtered.filter(e =>
+      inRange(e.startLocalISO, dateFrom, dateTo) ||
+      inRange(e.endLocalISO,   dateFrom, dateTo)
+    );
+  }
 
-  // Server-side pagination (3 per page)
+  // ---- Sort & slice a page of 3 (kept for compatibility) ----
+  filtered.sort((a, b) => Date.parse(a.startLocalISO) - Date.parse(b.startLocalISO));
   const countTotal = filtered.length;
-  const p = Math.max(0, pageStart | 0);
+  const p = Math.max(0, pageStart|0);
   const pageRows = filtered.slice(p, p + 3);
   const nextPageStart = p + 3 < countTotal ? p + 3 : p;
   const hasNext = p + 3 < countTotal;
 
   const speakable_page = pageRows.map(r => r.speakLine);
-  const entries_page = pageRows.map(r => ({
-    employeeNumber: r.employeeNumber,
-    site: r.site,
-    role: r.role,
-    startLocalISO: r.startLocalISO,
-    endLocalISO: r.endLocalISO,
-    hours: r.hours,
-    concise: r.concise,
-    hourType: r.hourType,
-    hourDescription: r.hourDescription,
-    scheduleDetailID: r.scheduleDetailID
+  const entries_page = pageRows.map(({employeeNumber, site, role, startLocalISO, endLocalISO, hours, concise, hourType, hourDescription, scheduleDetailID, cellId, id}) => ({
+    employeeNumber, site, role, startLocalISO, endLocalISO, hours, concise, hourType, hourDescription, scheduleDetailID, cellId, id
   }));
-
-  const speakable = filtered.map(r => r.speakLine);
-  const entries = filtered.map(r => ({
-    employeeNumber: r.employeeNumber,
-    site: r.site,
-    role: r.role,
-    startLocalISO: r.startLocalISO,
-    endLocalISO: r.endLocalISO,
-    hours: r.hours,
-    concise: r.concise,
-    hourType: r.hourType,
-    hourDescription: r.hourDescription,
-    scheduleDetailID: r.scheduleDetailID
-  }));
-
-  // Shift date param accept // 
-  const url = new URL(request.url);
-  const dateFrom = url.searchParams.get("dateFrom"); // YYYY-MM-DD
-  const dateTo   = url.searchParams.get("dateTo");   // YYYY-MM-DD
-  
-  function inRange(iso, fromYmd, toYmd) {
-    if (!fromYmd || !toYmd || !iso) return true;
-    // compare on date (midnight boundaries); treat iso as UTC date
-    const d = new Date(iso);
-    if (isNaN(d)) return false;
-    const ymd = d.toISOString().slice(0,10);
-    return (ymd >= fromYmd && ymd < toYmd);
-  }
-  
-  let filtered = Array.isArray(entries) ? entries : [];
-  if (dateFrom && dateTo) {
-    filtered = filtered.filter(e =>
-      inRange(e.startLocalISO || e.startIso, dateFrom, dateTo) ||
-      inRange(e.endLocalISO   || e.endIso,   dateFrom, dateTo)
-    );
-  }
-  
-  // then continue returning the same shape you already return, but with `entries: filtered`
-  return json({
-    success: true,
-    message: "Shifts lookup completed.",
-    counts: { rows: filtered.length, filtered: filtered.length },
-    page: { pageStart, nextPageStart, hasNext },
-    entries: filtered,
-    // you can still include entries_page/speakable_page if your front end expects them
-  });
-
-  
-  const mondayShiftText = entries[0]?.concise || "";
 
   return json({
     success: true,
@@ -538,10 +572,8 @@ if (!employeeNumber) {
     page: { pageStart: p, nextPageStart, hasNext, pageCount: pageRows.length },
     speakable_page,
     entries_page,
-    // legacy full lists (if you’re still using them)
-    speakable,
-    mondayShiftText,
-    entries,
+    speakable: filtered.map(r => r.speakLine),
+    entries: filtered,             // full list (with cellId)
     raw: wt.data
   });
 }
@@ -993,7 +1025,6 @@ async function handle(request, event) {
 ///////////////////////////////
 // Router (with logging)
 ///////////////////////////////
-
 export default {
   fetch: withLogging(async (req, env) => {
     const url = new URL(req.url);
@@ -1013,10 +1044,17 @@ export default {
       });
     }
 
-    if (method === "GET"  && path === "/debug/env")       return await handleEnvDebug(req, env);
-    if (method === "POST" && path === "/auth/employee")   return await handleAuthEmployee(req, env);
-    if (method === "POST" && path === "/winteam/shifts")  return await handleShifts(req, env);
-    if (method === "POST" && path === "/monday/write")    return await handleMondayWrite(req, env);
+    // Debug
+    if (method === "GET"  && path === "/debug/env")             return await handleEnvDebug(req, env);
+
+    // Core APIs
+    if (method === "POST" && path === "/auth/employee")         return await handleAuthEmployee(req, env);
+    if (method === "POST" && path === "/winteam/shifts")        return await handleShifts(req, env);
+    if (method === "POST" && path === "/monday/write")          return await handleMondayWrite(req, env);
+
+    // ZVA helpers
+    if (method === "POST" && path === "/zva/shift-write")       return await handleZvaShiftWrite(req, env);
+    if (method === "POST" && path === "/zva/shift-write-by-cell") return await handleZvaShiftWriteByCell(req, env);
 
     return json({ success: false, message: "Not found. Use POST /auth/employee, /winteam/shifts, /monday/write" }, { status: 404 });
   })
