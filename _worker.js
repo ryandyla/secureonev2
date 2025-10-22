@@ -910,10 +910,22 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
   const arr = Array.isArray(j?.entries) ? j.entries
             : Array.isArray(j?.entries_page) ? j.entries_page
             : [];
+  // Optional: small debug breadcrumb in logs when not found
+  const sample = arr.slice(0, 10).map(x => ({
+    cellId: String(x?.cellId ?? ""),
+    scheduleDetailID: String(x?.scheduleDetailID ?? "")
+  }));
 
+  
   // STRICT: only compare e.cellId
   const hit = arr.find(e => String(e?.cellId ?? "").trim() === want);
-  if (!hit) return null;
+  if (!hit) 
+    console.log("BY-CELL lookup miss", JSON.stringify({
+      want,
+      count: arr.length,
+      sample
+    }));  
+  return null;
 
   // Normalize what the writer needs
   return {
