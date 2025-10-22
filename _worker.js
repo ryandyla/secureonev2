@@ -371,11 +371,6 @@ async function handleShifts(req, env) {
   const fromDate = dateFrom || ymd(startBase);
   const toDate   = dateTo   || ymd(addDaysUTC(startBase, 15));
 
-const wtUrl = new URL(SHIFTS_BASE_EXACT);
-wtUrl.searchParams.set("employeeNumber", employeeNumber);
-wtUrl.searchParams.set("fromDate", fromDate);
-wtUrl.searchParams.set("toDate", toDate);
-
   if (!employeeNumber) {
     return json({ success:false, message:"employeeNumber is required." }, { status:400 });
   }
