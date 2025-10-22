@@ -765,10 +765,10 @@ async function handleZvaShiftWriteByCell(req, env) {
   };
 
   // TODO: wire to your real WinTeam helpers
-  const employee = await fetchEmployeeDetail(employeeNumber).catch(()=>null);
+  const employee = await fetchEmployeeDetail(employeeNumber, env).catch(()=>null);
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
-  const shift = await fetchShiftByCellId(employeeNumber, cellId).catch(()=>null);
+  const shift    = await fetchShiftByCellId(employeeNumber, cellId, env).catch(()=>null);
   if (!shift) return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
 
   const site     = (shift.site || shift.siteName || "").toString().trim();
@@ -808,14 +808,71 @@ async function handleZvaShiftWriteByCell(req, env) {
   }, { status: mData?.success ? 200 : 500 });
 }
 
-// ---- Stub helpers: replace with your existing WinTeam client ----
-async function fetchEmployeeDetail(employeeNumber) {
-  // TODO implement
-  return {};
+// ---- Winteam Helpers
+async function fetchEmployeeDetail(employeeNumber, env) {
+  const url = buildEmployeeURL(employeeNumber);
+  const wt = await callWinTeamJSON(url, env);
+  if (!wt.ok) throw new Error(`WinTeam employees failed (${wt.status}) ${wt.error||""}`);
+
+  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
+  const results = Array.isArray(page?.results) ? page.results : [];
+  const e = results[0];
+  if (!e) return null;
+  return {
+    fullName: [trim(e.firstName), trim(e.lastName)].filter(Boolean).join(" "),
+    workstate: trim(e.state || e.workState || ""),
+    supervisorDescription: trim(e.supervisorDescription || "")
+  };
 }
-async function fetchShiftByCellId(employeeNumber, cellId) {
-  // TODO implement
-  return null;
+/**
+ * Fetch a single shift by cellId (aka scheduleDetailID) for an employee.
+ * Uses a wide window so we don’t miss past/future dates.
+ */
+async function fetchShiftByCellId(employeeNumber, cellId, env) {
+  const norm = (v) => String(v ?? "").trim();
+  const want = norm(cellId);
+
+  // Search a reasonably-wide window (past 60d → next 90d)
+  const now = new Date();
+  const fromDate = ymd(addDaysUTC(now, -60));
+  const toDate   = ymd(addDaysUTC(now,  90));
+
+  const url = new URL(SHIFTS_BASE_EXACT);
+  url.searchParams.set("employeeNumber", String(employeeNumber));
+  url.searchParams.set("fromDate", fromDate);
+  url.searchParams.set("toDate", toDate);
+
+  const wt = await callWinTeamJSON(url.toString(), env);
+  if (!wt.ok) throw new Error(`WinTeam shiftDetails failed (${wt.status}) ${wt.error||""}`);
+
+  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
+  const results = Array.isArray(page?.results) ? page.results : [];
+
+  for (const r of results) {
+    const siteName = trim(r.jobDescription);
+    const roleName = trim(r.postDescription);
+    const shifts = Array.isArray(r.shifts) ? r.shifts : [];
+    for (const s of shifts) {
+      const have = norm(s.scheduleDetailID ?? s.cellId);
+      if (have && have === want) {
+        // Build normalized shape the writer expects
+        const startLocal = parseNaiveAsLocalWall(s.startTime);
+        let   endLocal   = parseNaiveAsLocalWall(s.endTime);
+        if (startLocal && endLocal && endLocal.getTime() <= startLocal.getTime()) {
+          endLocal = new Date(endLocal.getTime() + 24*60*60*1000); // overnight
+        }
+        return {
+          cellId: have,
+          site: siteName,
+          siteName,
+          role: roleName,
+          startLocalISO: startLocal ? startLocal.toISOString() : "",
+          endLocalISO:   endLocal   ? endLocal.toISOString()   : ""
+        };
+      }
+    }
+  }
+  return null; // not found in the window
 }
 
 ///////////////////////////////
