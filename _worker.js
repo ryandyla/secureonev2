@@ -309,21 +309,44 @@ function stateFromSupervisor(supervisorDescription = "") {
 }
 
 function deriveDepartmentFromReason(reasonRaw = "") {
-  // Keep it simple: match *phrases* you care about.
-  // Note: we use /i so no need to lower-case first.
-  if (/\b(payroll|pay\s*issue|pay\s*check|pay\s*stub|w-?2|tax|withhold)\b/i.test(reasonRaw)) {
+  // Keep matching by *phrases*; order matters (most specific first).
+  const r = String(reasonRaw || "").trim();
+
+  // 1) Payroll
+  if (/\b(payroll|pay\s*(issue|check|stub)|w-?2|withhold|tax)\b/i.test(r)) {
     return "Payroll";
   }
-  if (/\b(training|train|course|lms|cert(ificate)?|guard\s*card)\b/i.test(reasonRaw)) {
+
+  // 2) Training
+  if (/\b(training|train|course|lms|cert(ificate)?|guard\s*card)\b/i.test(r)) {
     return "Training";
   }
-  // Expanded coverage for ops-y reasons:
-  if (/\b(call(?:ing)?[-\s]*off|callout|no[-\s]*show|coverage|cover|late|tardy|time\s*card|timecard|punch|missed\s*punch|schedule|swap|shift\s*change|sick|pto|absence|absent)\b/i.test(reasonRaw)) {
+
+  // 3) Operations (expanded)
+  //    - calling off / sick / PTO
+  //    - late / arriving late
+  //    - leaving early / early out
+  //    - missed punch / timecard issues / schedule changes
+  //    - transportation trouble (car/bus/ride share)
+  //    - personal issues (family/child/doctor/appointment/emergency)
+  if (new RegExp([
+    // attendance / shift coverage
+    "\\b(call(?:ing)?\\s*off|callout|no\\s*show|coverage|cover|sick|pto|absence|absent)\\b",
+    // time-based issues
+    "\\b(late|arriv(?:e|ing)\\s*late|tardy|early\\s*out|leav(?:e|ing)\\s*early)\\b",
+    // timekeeping / scheduling
+    "\\b(time\\s*card|timecard|punch|missed\\s*punch|schedule|swap|shift\\s*change)\\b",
+    // transportation trouble
+    "\\b(transport|car\\s*(trouble|issue|problem|broke)|bus\\s*delay|uber|lyft|ride\\s*share|flat\\s*tire|traffic)\\b",
+    // personal issues
+    "\\b(personal\\s*(issue|matter)|family\\s*(issue|emergency|matter)|child|kids?|doctor|dr\\.?|appointment|emergency)\\b"
+  ].join("|"), "i").test(r)) {
     return "Operations";
   }
+
+  // 4) Fallback
   return "Other";
 }
-
 
 function mondayStatusLabel(label) {
   const v = String(label || "").trim();
