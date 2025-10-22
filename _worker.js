@@ -366,9 +366,15 @@ async function handleShifts(req, env) {
   }
 
   const employeeNumber = trim(body.employeeNumber);
-  const pageStart = Number(body.pageStart ?? 0) || 0;
-  const dateFrom  = trim(body.dateFrom || ""); // optional YYYY-MM-DD
-  const dateTo    = trim(body.dateTo   || ""); // optional YYYY-MM-DD
+  // ---- Choose window for WinTeam request ----
+  const startBase = nowAnchor();
+  const fromDate = dateFrom || ymd(startBase);
+  const toDate   = dateTo   || ymd(addDaysUTC(startBase, 15));
+
+const wtUrl = new URL(SHIFTS_BASE_EXACT);
+wtUrl.searchParams.set("employeeNumber", employeeNumber);
+wtUrl.searchParams.set("fromDate", fromDate);
+wtUrl.searchParams.set("toDate", toDate);
 
   if (!employeeNumber) {
     return json({ success:false, message:"employeeNumber is required." }, { status:400 });
