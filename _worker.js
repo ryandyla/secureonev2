@@ -366,21 +366,26 @@ async function handleShifts(req, env) {
   }
 
   const employeeNumber = trim(body.employeeNumber);
+  const pageStart = Number(body.pageStart ?? 0) || 0;
+
+  // Use distinct names to avoid collisions / shadowing
+  const reqDateFrom = trim(body.dateFrom || ""); // optional YYYY-MM-DD
+  const reqDateTo   = trim(body.dateTo   || ""); // optional YYYY-MM-DD
+
   if (!employeeNumber) {
     return json({ success:false, message:"employeeNumber is required." }, { status:400 });
   }
 
-  // ---- Pull a 15-day window from WinTeam ----
-  // ---- Choose window for WinTeam request (honor body dateFrom/dateTo if provided) ----
+  // ---- Choose window for WinTeam request (honor dateFrom/dateTo if provided) ----
   const startBase = nowAnchor();
-  const winFrom = dateFrom || ymd(startBase);
-  const winTo   = dateTo   || ymd(addDaysUTC(startBase, 15));
-  
+  const winFrom = reqDateFrom || ymd(startBase);
+  const winTo   = reqDateTo   || ymd(addDaysUTC(startBase, 15));
+
   const wtUrl = new URL(SHIFTS_BASE_EXACT);
   wtUrl.searchParams.set("employeeNumber", employeeNumber);
   wtUrl.searchParams.set("fromDate", winFrom);
   wtUrl.searchParams.set("toDate", winTo);
-  
+
   const wt = await callWinTeamJSON(wtUrl.toString(), env);
   if (!wt.ok) {
     return json(
@@ -412,11 +417,13 @@ async function handleShifts(req, env) {
         ` → ${pad2(endLocal.getUTCHours())}:${pad2(endLocal.getUTCMinutes())}` +
         (site ? ` @ ${site}` : "") + (role ? ` (${role})` : "");
 
-      const speakLine = `${weekdayMonthDay(startLocal)}, ${fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes())}`
-        + ` to ${weekdayMonthDay(endLocal)} ${fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes())}`
-        + (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
-      const cellId = String(s.cellId ?? "").trim();
-      const scheduleDetailID = String(s.scheduleDetailID ?? "").trim();
+      const speakLine =
+        `${weekdayMonthDay(startLocal)}, ${fmt12h(startLocal.getUTCHours(), startLocal.getUTCMinutes())}` +
+        ` to ${weekdayMonthDay(endLocal)} ${fmt12h(endLocal.getUTCHours(), endLocal.getUTCMinutes())}` +
+        (site ? ` at ${site}` : "") + (role ? ` (${role})` : "");
+
+      const cellId = String(s.cellId ?? s.cellID ?? s.CellId ?? s.CellID ?? s.cell ?? "").trim();
+      const scheduleDetailID = String(s.scheduleDetailID ?? s.ScheduleDetailID ?? s.scheduleDetailId ?? "").trim();
 
       rows.push({
         employeeNumber: trim(r.employeeNumber || employeeNumber),
@@ -424,9 +431,9 @@ async function handleShifts(req, env) {
         hours: s.hours,
         hourType: trim(s.hourType),
         hourDescription: trim(s.hourDescription),
-        cellId,                    // unique ID you want to use
-        scheduleDetailID,          // keep for reference; NOT used for identity
-        id: cellId,                // keep alias if you rely on id elsewhere
+        cellId,                 // unique ID we’ll use
+        scheduleDetailID,       // NOT unique; for reference only
+        id: cellId,             // alias if something expects .id
         startLocalISO: startLocal.toISOString(),
         endLocalISO:   endLocal.toISOString(),
         concise, speakLine
@@ -434,34 +441,23 @@ async function handleShifts(req, env) {
     }
   }
 
-  // ---- Apply the 15d window in each row’s local frame ----
-  const nowUTC = new Date();
-  const in15d = rows.filter(r => {
-    const startT = Date.parse(r.startLocalISO);
-    if (isNaN(startT)) return false;
-    const offset = Number(r.utcOffset || 0);
-    const nowLocal = new Date(nowUTC.getTime());
-    nowLocal.setUTCHours(nowLocal.getUTCHours() + offset);
-    const endLocal = new Date(nowLocal.getTime()); endLocal.setUTCDate(endLocal.getUTCDate() + 15);
-    return startT >= nowLocal.getTime() && startT <= endLocal.getTime();
-  });
-
-  // ---- Optional dateFrom/dateTo day-range filter (YYYY-MM-DD) ----
+  // ---- Optional additional narrowing by exact day range (if caller provided both) ----
   const inRange = (iso, fromYmd, toYmd) => {
     if (!fromYmd || !toYmd || !iso) return true;
     const d = new Date(iso); if (isNaN(d)) return false;
-    const ymd = d.toISOString().slice(0,10);
-    return (ymd >= fromYmd && ymd < toYmd);
+    const s = d.toISOString().slice(0,10);
+    return (s >= fromYmd && s < toYmd);
   };
-  let filtered = in15d;
-  if (dateFrom && dateTo) {
+
+  let filtered = rows;
+  if (reqDateFrom && reqDateTo) {
     filtered = filtered.filter(e =>
-      inRange(e.startLocalISO, dateFrom, dateTo) ||
-      inRange(e.endLocalISO,   dateFrom, dateTo)
+      inRange(e.startLocalISO, reqDateFrom, reqDateTo) ||
+      inRange(e.endLocalISO,   reqDateFrom, reqDateTo)
     );
   }
 
-  // ---- Sort & slice a page of 3 (kept for compatibility) ----
+  // ---- Sort & slice a page of 3 (compat) ----
   filtered.sort((a, b) => Date.parse(a.startLocalISO) - Date.parse(b.startLocalISO));
   const countTotal = filtered.length;
   const p = Math.max(0, pageStart|0);
@@ -477,13 +473,13 @@ async function handleShifts(req, env) {
   return json({
     success: true,
     message: "Shifts lookup completed.",
-    window: "now(local) → now+15d",
+    window: `${winFrom} → ${winTo}`,
     counts: { rows: rows.length, filtered: countTotal },
     page: { pageStart: p, nextPageStart, hasNext, pageCount: pageRows.length },
     speakable_page,
     entries_page,
     speakable: filtered.map(r => r.speakLine),
-    entries: filtered,             // full list (with cellId)
+    entries: filtered,
     raw: wt.data
   });
 }
