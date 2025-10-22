@@ -766,17 +766,22 @@ async function handleZvaShiftWriteByCell(req, env) {
 
   // --- 2) Fetch SHIFT details by calling our own /winteam/shifts and filtering by cellId
   let shift = null;
-  if (dateHint) {
-    shift = await fetchShiftByCellIdDateBound(employeeNumber, cellId, env, dateHint).catch(()=>null);
-  }
-  if (!shift) {
-    // fallback (older path via self-call)
-    shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }).catch(()=>null);
-  }
- if (!shift) {
-   console.log("ZVA DEBUG writer: no shift match", { employeeNumber, cellId, dateHint });
-   return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
- }
++  // --- 2) Fetch SHIFT details by calling our own /winteam/shifts and filtering by cellId
++  // Use the helper that actually exists: fetchShiftByCellIdViaSelf
++  let shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }).catch(()=>null);
++  // If a dateHint was provided but the narrow search missed, retry without the hint (wider 15-day window).
++  if (!shift && dateHint) {
++    try {
++      console.log("ZVA DEBUG writer: no hit with dateHint; retrying without dateHint", { employeeNumber, cellId, dateHint });
++      shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint: "" });
++    } catch (e) {
++      console.log("ZVA DEBUG writer: retry fetch without dateHint threw", String(e && e.message || e));
++    }
++  }
++  if (!shift) {
++    console.log("ZVA DEBUG writer: Shift not found by cellId in either attempt", { employeeNumber, cellId, dateHint });
++    return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
++  }
 
   const site     = (shift.site || shift.siteName || "").toString().trim();
   const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
