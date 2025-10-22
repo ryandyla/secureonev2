@@ -561,6 +561,22 @@ function buildMondayColumnsFromFriendly(body) {
   return out;
 }
 
+async function fetchEmployeeDetail(employeeNumber, env) {
+  const url = buildEmployeeURL(employeeNumber);
+  const wt = await callWinTeamJSON(url, env);
+  if (!wt.ok) throw new Error(`WinTeam employees failed (${wt.status}) ${wt.error || ""}`);
+
+  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
+  const results = Array.isArray(page?.results) ? page.results : [];
+  const e = results[0];
+  if (!e) return null;
+  return {
+    fullName: [trim(e.firstName), trim(e.lastName)].filter(Boolean).join(" "),
+    workstate: trim(e.state || e.workState || ""),
+    supervisorDescription: trim(e.supervisorDescription || "")
+  };
+}
+
 async function handleMondayWrite(req, env) {
   const body = await readJson(req);
   if (!body) return json({ success: false, message: "Invalid JSON body." }, { status: 400 });
@@ -732,8 +748,57 @@ async function handleZvaShiftWrite(req, env) {
   }, { status: mData?.success ? 200 : 500 });
 }
 
+// Fetch a single shift by cellId directly from WinTeam.
+// If fromDate/toDate are omitted, uses a wide window (past 60d → next 90d).
+async function fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate, toDate }) {
+  const want = String(cellId ?? "").trim();
+  if (!employeeNumber || !want) return null;
+
+  const now = new Date();
+  const from = fromDate || ymd(addDaysUTC(now, -60));
+  const to   = toDate   || ymd(addDaysUTC(now,  90));
+
+  const url = new URL(SHIFTS_BASE_EXACT);
+  url.searchParams.set("employeeNumber", String(employeeNumber));
+  url.searchParams.set("fromDate", from);
+  url.searchParams.set("toDate", to);
+
+  const wt = await callWinTeamJSON(url.toString(), env);
+  if (!wt.ok) {
+    throw new Error(`WinTeam shiftDetails failed (${wt.status}) ${wt.error || ""}`);
+  }
+
+  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
+  const results = Array.isArray(page?.results) ? page.results : [];
+
+  for (const r of results) {
+    const siteName = trim(r.jobDescription);
+    const shifts = Array.isArray(r.shifts) ? r.shifts : [];
+    for (const s of shifts) {
+      const have = String(s.cellId ?? "").trim(); // STRICT: cellId only (NOT scheduleDetailID)
+      if (have && have === want) {
+        const startLocal = parseNaiveAsLocalWall(s.startTime);
+        let   endLocal   = parseNaiveAsLocalWall(s.endTime);
+        if (startLocal && endLocal && endLocal.getTime() <= startLocal.getTime()) {
+          endLocal = new Date(endLocal.getTime() + 24*60*60*1000); // overnight
+        }
+        return {
+          cellId: have,
+          site: siteName,
+          siteName,
+          startLocalISO: startLocal ? startLocal.toISOString() : "",
+          endLocalISO:   endLocal   ? endLocal.toISOString()   : ""
+        };
+      }
+    }
+  }
+  return null;
+}
+
+
+
 // Write by cellId (preferred)
-// Write by cellId (preferred)
+// Write by cellId (preferred) — no self-call, go straight to WinTeam
 async function handleZvaShiftWriteByCell(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -744,7 +809,7 @@ async function handleZvaShiftWriteByCell(req, env) {
   const reason         = String(body.reason || "calling off sick").trim();
   const aniRaw         = String(body.ani || "").trim();
   const engagementId   = String(body.engagementId || "").trim();
-  const dateHint       = String(body.dateHint || "").trim();
+  const dateHint       = String(body.dateHint || "").trim(); // optional: "YYYY-MM-DD"
 
   if (!employeeNumber) return json({ success:false, message:"employeeNumber required" }, { status:400 });
   if (!cellId)         return json({ success:false, message:"cellId required" }, { status:400 });
@@ -763,46 +828,46 @@ async function handleZvaShiftWriteByCell(req, env) {
   };
   const callerId = normPhone(aniRaw);
 
-  // Best-effort employee info
+  // Try to get name (non-fatal if it fails)
   let employee = null;
   try {
     employee = await fetchEmployeeDetail(employeeNumber, env);
   } catch (e) {
-    console.log("ZVA DEBUG writer: fetchEmployeeDetail threw", String(e && e.message || e));
+    console.log("ZVA DEBUG writer: fetchEmployeeDetail threw", String(e?.message || e));
   }
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
-  // 1) Try via self with dateHint
+  // 1) If we have a dateHint, search that exact day window first
   let shift = null;
-  try {
-    shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint });
-  } catch (e) {
-    console.log("ZVA DEBUG writer: viaSelf w/dateHint threw", String(e && e.message || e));
+  if (dateHint) {
+    try {
+      const d = new Date(dateHint);
+      if (!isNaN(d)) {
+        const y = d.getUTCFullYear();
+        const m = String(d.getUTCMonth() + 1).padStart(2,"0");
+        const day = String(d.getUTCDate()).padStart(2,"0");
+        const from = `${y}-${m}-${day}`;
+        const toDate = new Date(d.getTime() + 24*60*60*1000);
+        const to = `${toDate.getUTCFullYear()}-${String(toDate.getUTCMonth()+1).padStart(2,"0")}-${String(toDate.getUTCDate()).padStart(2,"0")}`;
+        shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: from, toDate: to });
+        if (!shift) {
+          console.log("ZVA DEBUG writer: no hit with dateHint; will try wide window", { employeeNumber, cellId, dateHint });
+        }
+      }
+    } catch {}
   }
 
-  // 2) If that failed and we had a dateHint, retry via self without it
-  if (!shift && dateHint) {
-    console.log("ZVA DEBUG writer: no hit with dateHint; retrying without dateHint", { employeeNumber, cellId, dateHint });
+  // 2) If still no hit, do a wide window
+  if (!shift) {
     try {
-      shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint: "" });
+      shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId });
     } catch (e) {
-      console.log("ZVA DEBUG writer: viaSelf retry threw", String(e && e.message || e));
+      console.log("ZVA DEBUG writer: wide WinTeam lookup threw", String(e?.message || e));
     }
   }
 
-  // 3) If still no hit, do a wide direct WinTeam lookup
   if (!shift) {
-    try {
-      console.log("ZVA DEBUG writer: falling back to wide WinTeam window for cellId", { employeeNumber, cellId });
-      shift = await fetchShiftByCellId(employeeNumber, cellId, env);
-      if (shift) console.log("ZVA DEBUG writer: wide WinTeam lookup succeeded", { found: true, cellId: shift.cellId });
-    } catch (e) {
-      console.log("ZVA DEBUG writer: wide WinTeam lookup threw", String(e && e.message || e));
-    }
-  }
-
-  if (!shift) {
-    console.log("ZVA DEBUG writer: Shift not found by cellId after all attempts", { employeeNumber, cellId, dateHint });
+    console.log("ZVA DEBUG writer: Shift not found by cellId after direct lookups", { employeeNumber, cellId, dateHint });
     return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
   }
 
@@ -810,8 +875,8 @@ async function handleZvaShiftWriteByCell(req, env) {
   const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
   const endISO   = (shift.endLocalISO   || shift.endIso   || "").toString().trim();
 
-  const itemName = `${employeeNumber || "unknown"} | ${fullName || "Unknown Caller"}`;
-  const dateKey  = startISO ? startISO.slice(0,10) : "date?";
+  const itemName  = `${employeeNumber || "unknown"} | ${fullName || "Unknown Caller"}`;
+  const dateKey   = startISO ? startISO.slice(0,10) : "date?";
   const dedupeKey = engagementId || [employeeNumber || "emp?", site || "site?", dateKey].join("|");
 
   const mondayBody = { itemName, dedupeKey };
@@ -831,7 +896,7 @@ async function handleZvaShiftWriteByCell(req, env) {
     });
     mData = await mResp.json();
   } catch (e) {
-    console.log("ZVA DEBUG writer: Monday write threw", String(e && e.message || e));
+    console.log("ZVA DEBUG writer: Monday write threw", String(e?.message || e));
     return json({ success:false, message:`Monday write failed: ${e?.message || e}` }, { status:502 });
   }
 
