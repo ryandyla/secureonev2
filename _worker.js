@@ -812,7 +812,7 @@ async function fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate,
 
 
 // Write by cellId (preferred)
-// Write by cellId (preferred) — no self-call, go straight to WinTeam
+// Write by cellId (preferred) — direct WinTeam lookup + direct Monday write
 async function handleZvaShiftWriteByCell(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -828,8 +828,7 @@ async function handleZvaShiftWriteByCell(req, env) {
   if (!employeeNumber) return json({ success:false, message:"employeeNumber required" }, { status:400 });
   if (!cellId)         return json({ success:false, message:"cellId required" }, { status:400 });
 
-  const origin = new URL(req.url).origin;
-
+  // Normalize caller ID (E.164 if possible)
   const normPhone = (raw) => {
     if (!raw) return "";
     const s = String(raw);
@@ -842,7 +841,7 @@ async function handleZvaShiftWriteByCell(req, env) {
   };
   const callerId = normPhone(aniRaw);
 
-  // Try to get name (non-fatal if it fails)
+  // Try to get employee name (non-fatal)
   let employee = null;
   try {
     employee = await fetchEmployeeDetail(employeeNumber, env);
@@ -851,8 +850,10 @@ async function handleZvaShiftWriteByCell(req, env) {
   }
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
-  // 1) If we have a dateHint, search that exact day window first
+  // ---- Find the shift by cellId ----
   let shift = null;
+
+  // 1) If dateHint provided, first search just that day
   if (dateHint) {
     try {
       const d = new Date(dateHint);
@@ -871,7 +872,7 @@ async function handleZvaShiftWriteByCell(req, env) {
     } catch {}
   }
 
-  // 2) If still no hit, do a wide window
+  // 2) If still no hit, do a wide window (past 60d → next 90d)
   if (!shift) {
     try {
       shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId });
@@ -880,6 +881,7 @@ async function handleZvaShiftWriteByCell(req, env) {
     }
   }
 
+  // Fail if we still don't have a shift
   if (!shift) {
     console.log("ZVA DEBUG writer: Shift not found by cellId after direct lookups", { employeeNumber, cellId, dateHint });
     return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
@@ -889,37 +891,85 @@ async function handleZvaShiftWriteByCell(req, env) {
   const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
   const endISO   = (shift.endLocalISO   || shift.endIso   || "").toString().trim();
 
+  // ---- Monday write (direct, no self-call) ----
   const itemName  = `${employeeNumber || "unknown"} | ${fullName || "Unknown Caller"}`;
   const dateKey   = startISO ? startISO.slice(0,10) : "date?";
   const dedupeKey = engagementId || [employeeNumber || "emp?", site || "site?", dateKey].join("|");
 
-  const mondayBody = { itemName, dedupeKey };
-  if (site)        mondayBody.accountSite = site;
-  if (startISO)    mondayBody.shiftStart  = startISO;
-  if (endISO)      mondayBody.shiftEnd    = endISO;
-  if (callerId)    mondayBody.callerId    = callerId;
-  if (reason)      mondayBody.reason      = reason;
-  if (engagementId) mondayBody.engagementId = engagementId;
-
-  let mData = null;
-  try {
-    const mResp = await fetch(`${origin}/monday/write`, {
-      method: "POST",
-      headers: { "content-type":"application/json" },
-      body: JSON.stringify(mondayBody)
-    });
-    mData = await mResp.json();
-  } catch (e) {
-    console.log("ZVA DEBUG writer: Monday write threw", String(e?.message || e));
-    return json({ success:false, message:`Monday write failed: ${e?.message || e}` }, { status:502 });
+  const boardId = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
+  if (!boardId) {
+    return json({ success:false, message:"MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID not configured." }, { status:400 });
   }
 
+  // Flow guard to prevent duplicates
+  if (dedupeKey && (await flowGuardSeen(env, dedupeKey))) {
+    return json({
+      success: true,
+      message: "Duplicate suppressed by flow guard.",
+      sent: { employeeNumber, cellId, site, startISO, endISO, reason, callerId, engagementId, itemName, dedupeKey },
+      monday: { upserted:false, item:null }
+    });
+  }
+
+  // Build Monday column values from our friendly fields
+  const cvFriendly = {
+    site,                         // text_mktj4gmt
+    reason,                       // text_mktdb8pg
+    callerId,                     // phone_mkv0p9q3
+    startTime: startISO,          // text_mkv0t29z
+    endTime: endISO,              // text_mkv0nmq1
+    zoomGuid: engagementId || "", // text_mkv7j2fq
+    // nice one-liner
+    shift: `${(startISO||"").slice(0,16)} → ${(endISO||"").slice(11,16)} @ ${site || ""}`.trim()
+  };
+  const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
+  const cvString = JSON.stringify(columnValues);
+
+  // Create item
+  const createMutation = `
+    mutation ($boardId: ID!, $itemName: String!) {
+      create_item (board_id: $boardId, item_name: $itemName) {
+        id
+        name
+        board { id }
+      }
+    }
+  `;
+  let created;
+  try {
+    const res = await mondayGraphQL(env, createMutation, { boardId, itemName });
+    created = res.create_item;
+  } catch (e) {
+    console.log("ZVA DEBUG writer: Monday create_item threw", String(e?.message || e));
+    return json({ success:false, message:`Monday create_item failed: ${e?.message || e}` }, { status:502 });
+  }
+
+  // Apply columns
+  if (Object.keys(columnValues).length) {
+    const changeMutation = `
+      mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
+        change_multiple_column_values (board_id: $boardId, item_id: $itemId, column_values: $cv) {
+          id
+          name
+        }
+      }
+    `;
+    try {
+      await mondayGraphQL(env, changeMutation, { boardId, itemId: String(created.id), cv: cvString });
+    } catch (e) {
+      console.log("ZVA DEBUG writer: Monday change_multiple_column_values threw", String(e?.message || e));
+      return json({ success:false, message:`Monday change columns failed: ${e?.message || e}` }, { status:502 });
+    }
+  }
+
+  if (dedupeKey) await flowGuardMark(env, dedupeKey);
+
   return json({
-    success: !!mData?.success,
-    message: mData?.message || "Done.",
+    success: true,
+    message: "Monday item created/updated.",
     sent: { employeeNumber, cellId, site, startISO, endISO, reason, callerId, engagementId, itemName, dedupeKey },
-    monday: mData
-  }, { status: mData?.success ? 200 : 500 });
+    monday: { item: created, columnValuesSent: columnValues }
+  }, { status: 200 });
 }
 
 // Look up a single shift by cellId by calling our own /winteam/shifts and filtering.
