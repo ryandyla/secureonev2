@@ -573,7 +573,9 @@ async function fetchEmployeeDetail(employeeNumber, env) {
   return {
     fullName: [trim(e.firstName), trim(e.lastName)].filter(Boolean).join(" "),
     workstate: trim(e.state || e.workState || ""),
-    supervisorDescription: trim(e.supervisorDescription || "")
+    supervisorDescription: trim(e.supervisorDescription || ""),
+    emailAddress: trim(e.emailAddress || ""),
+    phone1: normalizeUsPhone(e.phone1 || "")
   };
 }
 
@@ -895,34 +897,37 @@ async function handleZvaShiftWriteByCell(req, env) {
   const itemName  = `${employeeNumber || "unknown"} | ${fullName || "Unknown Caller"}`;
   const dateKey   = startISO ? startISO.slice(0,10) : "date?";
   const dedupeKey = engagementId || [employeeNumber || "emp?", site || "site?", dateKey].join("|");
-
-  const boardId = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
-  if (!boardId) {
-    return json({ success:false, message:"MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID not configured." }, { status:400 });
-  }
-
-  // Flow guard to prevent duplicates
-  if (dedupeKey && (await flowGuardSeen(env, dedupeKey))) {
-    return json({
-      success: true,
-      message: "Duplicate suppressed by flow guard.",
-      sent: { employeeNumber, cellId, site, startISO, endISO, reason, callerId, engagementId, itemName, dedupeKey },
-      monday: { upserted:false, item:null }
-    });
-  }
-
-  // Build Monday column values from our friendly fields
+  
+  // Helpful derived fields
+  const division   = stateFromSupervisor(employee?.supervisorDescription || "");
+  const department = deriveDepartmentFromReason(reason || "");
+  
+  // Build the Monday column values from our “friendly” keys.
+  // buildMondayColumnsFromFriendly will:
+  //  - Map status/text/phone/email properly
+  //  - Auto-derive Division from supervisorDescription only if we don’t supply it
+  //  - Parse dateTime strings into Monday’s date/time JSON
+  const nowISO = new Date().toISOString();
+  
   const cvFriendly = {
     site,                         // text_mktj4gmt
     reason,                       // text_mktdb8pg
-    callerId,                     // phone_mkv0p9q3
+    callerId,                     // phone_mkv0p9q3  (E.164 if possible)
     startTime: startISO,          // text_mkv0t29z
     endTime: endISO,              // text_mkv0nmq1
     zoomGuid: engagementId || "", // text_mkv7j2fq
-    // nice one-liner
-    shift: `${(startISO||"").slice(0,16)} → ${(endISO||"").slice(11,16)} @ ${site || ""}`.trim()
+    // nice one-liner summary:
+    shift: `${(startISO||"").slice(0,16)} → ${(endISO||"").slice(11,16)} @ ${site || ""}`.trim(),
+  
+    // New bits:
+    division,                     // color_mktd81zp (Status)
+    department,                   // color_mktsk31h (Status)
+    dateTime: nowISO,             // date4 (auto split into date/time)
+    email: employee?.emailAddress || "", // email_mktdyt3z
+    phone: employee?.phone1 || ""        // phone_mktdphra
   };
   const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
+
   const cvString = JSON.stringify(columnValues);
 
   // Create item
