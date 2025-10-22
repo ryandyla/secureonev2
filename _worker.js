@@ -237,6 +237,32 @@ function buildEmployeeURL(employeeNumber) {
   return url.toString();
 }
 
+function deriveDepartmentEmail(supervisorDescription = "", department = "") {
+  const sup = String(supervisorDescription || "").trim();
+  const dep = String(department || "").trim();
+
+  // Dept-wide addresses first (explicit department wins)
+  if (/^training$/i.test(dep)) return "training@secureone.com";
+  if (/^payroll$/i.test(dep))  return "payroll@secureone.com";
+  if (/^hr$/i.test(dep))       return "hr@secureone.com";
+
+  // Ops state teams (allowed states only)
+  // Examples that should match:
+  //  - "IL Ops Team", "AZ Operations", "TX Operations Team", "AL Ops"
+  const OPS_STATES = new Set(["IL","AZ","TX","AL","TN","IN","OH"]);
+  const m = sup.match(/\b(AL|AZ|TX|IL|TN|IN|OH)\b.*\b(Ops|Operations)\b/i);
+  if (m) {
+    const st = m[1].toUpperCase();
+    if (OPS_STATES.has(st)) {
+      return `${st.toLowerCase()}opsteam@secureone.com`; // e.g., "ilopsteam@secureone.com"
+    }
+  }
+
+  // No match → no department email
+  return "";
+}
+
+
 async function mondayGraphQL(env, query, variables) {
   const token = env.MONDAY_API_KEY;
   if (!token) throw new Error("MONDAY_API_KEY not configured.");
@@ -946,7 +972,7 @@ async function handleZvaShiftWriteByCell(req, env) {
   // Helpful derived fields
   const division   = stateFromSupervisor(employee?.supervisorDescription || "");
   const department = deriveDepartmentFromReason(reason || "");
-  
+  const deptEmail  = deriveDepartmentEmail(employee?.supervisorDescription || "", department);
   // Build the Monday column values from our “friendly” keys.
   // buildMondayColumnsFromFriendly will:
   //  - Map status/text/phone/email properly
@@ -971,6 +997,7 @@ async function handleZvaShiftWriteByCell(req, env) {
     // New bits:
     division,                     // color_mktd81zp (Status)
     department,                   // color_mktsk31h (Status)
+    deptEmail: deptEmail,
     dateTime: nowISO,             // date4 (auto split into date/time)
     email: employee?.emailAddress || "", // email_mktdyt3z
     phone: employee?.phone1 || ""        // phone_mktdphra
