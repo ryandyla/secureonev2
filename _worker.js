@@ -151,19 +151,39 @@ async function cloneBodyPreview(reqOrResp) {
     return maskPII(text).slice(0, MAX_LOG_BODY);
   } catch { return ""; }
 }
+
+function shortId() {
+  return Math.random().toString(36).slice(2, 8);
+}
+
+function pretty(obj) {
+  try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
+}
+
+function compact(obj) {
+  try { return JSON.stringify(obj); } catch { return String(obj); }
+}
+
 function withLogging(handler) {
   return async (req, env, ctx) => {
     const start = Date.now();
     const url = new URL(req.url);
+    const reqId = req.headers.get("cf-ray") || shortId();
+    const wantPretty = (env && String(env.PRETTY_LOGS).toLowerCase() === "true") || url.searchParams.get("pretty") === "1";
+
     const reqPreview = await cloneBodyPreview(req);
     let res;
-    try { res = await handler(req, env, ctx); }
-    catch (e) { res = json({ success:false, message:"Unhandled error.", detail:String(e?.message || e) }, { status: 500 }); }
-    const resPreview = await cloneBodyPreview(res);
+    try {
+      res = await handler(req, env, ctx);
+    } catch (e) {
+      res = json({ success:false, message:"Unhandled error.", detail:String(e && e.message || e) }, { status: 500 });
+    }
     const ms = Date.now() - start;
-    console.log("HTTP", JSON.stringify({
+    const resPreview = await cloneBodyPreview(res);
+
+    const record = {
       at: new Date().toISOString(),
-      ray: req.headers.get("cf-ray") || undefined,
+      reqId,
       method: req.method,
       path: url.pathname,
       query: Object.fromEntries(url.searchParams.entries()),
@@ -173,7 +193,13 @@ function withLogging(handler) {
       resHeaders: headerObj(res.headers || new Headers()),
       resBody: resPreview,
       ms
-    }));
+    };
+
+    if (wantPretty) {
+      console.log(`\n──── HTTP (${record.method} ${record.path}) #${reqId} ────\n${pretty(record)}\n`);
+    } else {
+      console.log("HTTP", compact(record));
+    }
     return res;
   };
 }
@@ -922,6 +948,26 @@ async function handleZvaShiftWriteByCell(req, env) {
   }
 
   if (dedupeKey) await flowGuardMark(env, dedupeKey);
+
+  // Friendly one-liner for demos / customers
+  try {
+    const summary = {
+      employeeNumber,
+      cellId,
+      site,
+      date: (startISO || "").slice(0, 10),
+      timeInOut: ofctimeinorout || "",
+      reason,
+      department,
+      deptEmail,
+      mondayItemId: created?.id || null,
+      dedupeKey
+    };
+    // emoji badges make it pop in tail output; still PII-safe due to upstream masking
+    console.log(`✅ ZVA SUMMARY: ${pretty(summary)}`);
+  } catch (e) {
+    console.log("ZVA SUMMARY build error", String(e && e.message || e));
+  }
 
   return json({
     success: true,
