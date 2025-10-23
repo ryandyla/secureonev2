@@ -565,8 +565,8 @@ async function handleShifts(req, env) {
 
   const employeeNumber = trim(body.employeeNumber);
   const pageStart = Number(body.pageStart ?? 0) || 0;
-  let reqDateFrom = trim(body.dateFrom || "");
-  let reqDateTo   = trim(body.dateTo   || "");
+  const reqDateFrom = trim(body.dateFrom || body.fromDate || "");
+  const reqDateTo   = trim(body.dateTo   || body.toDate   || "");
 
   if (!employeeNumber) return json({ success:false, message:"employeeNumber is required." }, { status:400 });
 
@@ -835,7 +835,8 @@ async function handleZvaShiftWriteByCell(req, env) {
 
   // 2) If not found, try ±10 days around anchor (21-day window, safely < 30)
   if (!shift && anchorYmd) {
-    const around = windowAround(anchorYmd, 10, 10);
+    const around = windowAround(anchorYmd, 14, 14); // 29-day window (safe under WinTeam's <30d cap)
+
     console.log("ZVA DEBUG writer: date window around", around);
     shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: around.from, toDate: around.to });
   }
