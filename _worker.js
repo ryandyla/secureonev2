@@ -138,48 +138,83 @@ function maskPII(str) {
   s = s.replace(/("ssnLast4"\s*:\s*")(\d{0,4})(")/gi, (_, a, b, c) => a + (b ? "***" + b.slice(-1) : "***") + c);
   return s;
 }
+
+function summarizePayload(payload, { maxArray = 5, maxString = 400 } = {}) {
+  // Returns a JSON-serializable copy with large arrays/strings truncated for readability
+  const seen = new WeakSet();
+
+  function walk(v) {
+    if (v == null) return v;
+    if (typeof v === "string") {
+      const s = maskPII(v);
+      return s.length > maxString ? s.slice(0, maxString) + "…(+)" : s;
+    }
+    if (typeof v !== "object") return v;
+
+    if (seen.has(v)) return "[Circular]";
+    seen.add(v);
+
+    if (Array.isArray(v)) {
+      const out = v.slice(0, maxArray).map(walk);
+      if (v.length > maxArray) out.push(`…and ${v.length - maxArray} more`);
+      return out;
+    }
+
+    const out = {};
+    for (const k of Object.keys(v)) {
+      out[k] = walk(v[k]);
+    }
+    return out;
+  }
+
+  return walk(payload);
+}
+
 async function cloneBodyPreview(reqOrResp) {
+  // Try to parse JSON and return an OBJECT (not a string)
   try {
     const ct = reqOrResp.headers?.get?.("content-type") || "";
     if (/json/i.test(ct)) {
-      const text = JSON.stringify(await reqOrResp.clone().json());
-      return maskPII(text).slice(0, MAX_LOG_BODY);
+      const data = await reqOrResp.clone().json();
+      return data;
     }
   } catch {}
+
+  // Fallback to plain text for non-JSON or parse errors
   try {
     const text = await reqOrResp.clone().text();
     return maskPII(text).slice(0, MAX_LOG_BODY);
-  } catch { return ""; }
+  } catch {
+    return "";
+  }
 }
 
-function shortId() {
-  return Math.random().toString(36).slice(2, 8);
-}
-
-function pretty(obj) {
-  try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
-}
-
-function compact(obj) {
-  try { return JSON.stringify(obj); } catch { return String(obj); }
-}
+function shortId() { return Math.random().toString(36).slice(2, 8); }
+function pretty(obj) { try { return JSON.stringify(obj, null, 2); } catch { return String(obj); } }
+function compact(obj) { try { return JSON.stringify(obj); } catch { return String(obj); } }
 
 function withLogging(handler) {
   return async (req, env, ctx) => {
     const start = Date.now();
     const url = new URL(req.url);
     const reqId = req.headers.get("cf-ray") || shortId();
-    const wantPretty = (env && String(env.PRETTY_LOGS).toLowerCase() === "true") || url.searchParams.get("pretty") === "1";
+    const wantPretty =
+      (env && String(env.PRETTY_LOGS).toLowerCase() === "true") ||
+      url.searchParams.get("pretty") === "1";
 
-    const reqPreview = await cloneBodyPreview(req);
+    const reqPreviewRaw = await cloneBodyPreview(req);
+    const reqPreview = summarizePayload(reqPreviewRaw);
+
     let res;
     try {
       res = await handler(req, env, ctx);
     } catch (e) {
       res = json({ success:false, message:"Unhandled error.", detail:String(e && e.message || e) }, { status: 500 });
     }
+
     const ms = Date.now() - start;
-    const resPreview = await cloneBodyPreview(res);
+    const resPreviewRaw = await cloneBodyPreview(res);
+    const resPreview = summarizePayload(resPreviewRaw);
 
     const record = {
       at: new Date().toISOString(),
@@ -191,7 +226,7 @@ function withLogging(handler) {
       reqBody: reqPreview,
       status: res.status,
       resHeaders: headerObj(res.headers || new Headers()),
-      resBody: resPreview,
+      resBody: resPreview,   // <— now an OBJECT, summarized
       ms
     };
 
