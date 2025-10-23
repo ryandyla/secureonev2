@@ -94,6 +94,29 @@ function parseNaiveAsLocalWall(isoNoTZ) {
 }
 function nowAnchor() { return new Date(); }
 
+function ymdFromISODate(isoOrYmd) {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(isoOrYmd))) return String(isoOrYmd);
+  const d = new Date(String(isoOrYmd));
+  return isNaN(d) ? "" : `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;
+}
+function ymdAdd(ymdStr, days) {
+  const [y,m,d] = ymdStr.split("-").map(n=>+n);
+  const t = Date.UTC(y, m-1, d) + days*24*60*60*1000;
+  const D = new Date(t);
+  return `${D.getUTCFullYear()}-${String(D.getUTCMonth()+1).padStart(2,"0")}-${String(D.getUTCDate()).padStart(2,"0")}`;
+}
+function windowExactDay(ymdStr) {
+  const from = ymdStr;
+  const to   = ymdAdd(ymdStr, 1); // next day
+  return { from, to };
+}
+function windowAround(ymdStr, beforeDays = 10, afterDays = 10) {
+  const from = ymdAdd(ymdStr, -Math.abs(beforeDays));
+  const to   = ymdAdd(ymdStr,  Math.abs(afterDays));
+  return { from, to };
+}
+
+
 ///////////////////////////////
 // Logging (PII-safe)
 ///////////////////////////////
@@ -396,62 +419,53 @@ async function fetchEmployeeDetail(employeeNumber, env) {
 }
 
 // Chunked (≤30d) cellId lookup; single-day when from/to provided
+// Direct lookup within a provided window (kept < 30d). No chunking.
 async function fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate, toDate }) {
   const want = String(cellId ?? "").trim();
   if (!employeeNumber || !want) return null;
+  if (!fromDate || !toDate) return null;
 
-  const tryWindow = async (fromYmd, toYmd) => {
-    const url = new URL(SHIFTS_BASE_EXACT);
-    url.searchParams.set("employeeNumber", String(employeeNumber));
-    url.searchParams.set("fromDate", fromYmd);
-    url.searchParams.set("toDate", toYmd);
-    const wt = await callWinTeamJSON(url.toString(), env);
-    if (!wt.ok) {
-      console.log("ZVA DEBUG writer: WT window failed", { fromYmd, toYmd, status: wt.status, err: (wt.error || "").slice(0,160) });
-      return null;
-    }
-    const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
-    const results = Array.isArray(page?.results) ? page.results : [];
-    for (const r of results) {
-      const siteName = (r.jobDescription || "").toString().trim();
-      const shifts = Array.isArray(r.shifts) ? r.shifts : [];
-      for (const s of shifts) {
-        const have = String(s.cellId ?? "").trim();
-        if (have && have === want) {
-          const startLocal = parseNaiveAsLocalWall(s.startTime);
-          let   endLocal   = parseNaiveAsLocalWall(s.endTime);
-          if (startLocal && endLocal && endLocal.getTime() <= startLocal.getTime()) {
-            endLocal = new Date(endLocal.getTime() + 24*60*60*1000);
-          }
-          return {
-            cellId: have,
-            site: siteName,
-            siteName,
-            startLocalISO: startLocal ? startLocal.toISOString() : "",
-            endLocalISO:   endLocal   ? endLocal.toISOString()   : ""
-          };
-        }
-      }
-    }
+  // clamp to 29 days max just in case
+  const fromD = new Date(fromDate + "T00:00:00Z");
+  const toD   = new Date(toDate   + "T00:00:00Z");
+  const maxTo = new Date(fromD.getTime() + 29*24*60*60*1000);
+  const toClamped = (toD > maxTo ? maxTo : toD);
+  const fromY = ymd(fromD), toY = ymd(toClamped);
+
+  const url = new URL(SHIFTS_BASE_EXACT);
+  url.searchParams.set("employeeNumber", String(employeeNumber));
+  url.searchParams.set("fromDate", fromY);
+  url.searchParams.set("toDate", toY);
+
+  const wt = await callWinTeamJSON(url.toString(), env);
+  if (!wt.ok) {
+    console.log("ZVA DEBUG writer: WT window failed", { fromYmd: fromY, toYmd: toY, status: wt.status, err: (wt.error || "").slice(0,160) });
     return null;
-  };
-
-  if (fromDate && toDate) {
-    const fromD = new Date(fromDate + "T00:00:00Z");
-    const toD   = new Date(toDate   + "T00:00:00Z");
-    const maxTo = new Date(fromD.getTime() + 30*24*60*60*1000);
-    const toClamped = (toD > maxTo ? maxTo : toD);
-    return await tryWindow(ymd(fromD), ymd(toClamped));
   }
 
-  // Search around "now" in ≤30d chunks (ordered nearest-first)
-  const now = new Date();
-  const span = (a,b) => ({ from: ymd(addDaysUTC(now, a)), to: ymd(addDaysUTC(now, b)) });
-  const windows = [ span(-15,+15), span(-30,0), span(0,+30), span(-60,-30), span(+30,+60), span(-90,-60), span(+60,+90) ];
+  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
+  const results = Array.isArray(page?.results) ? page.results : [];
 
-  for (const w of windows) {
-    const hit = await tryWindow(w.from, w.to);
-    if (hit) return hit;
+  for (const r of results) {
+    const siteName = (r.jobDescription || "").toString().trim();
+    const shifts = Array.isArray(r.shifts) ? r.shifts : [];
+    for (const s of shifts) {
+      const have = String(s.cellId ?? "").trim();
+      if (have && have === want) {
+        const startLocal = parseNaiveAsLocalWall(s.startTime);
+        let   endLocal   = parseNaiveAsLocalWall(s.endTime);
+        if (startLocal && endLocal && endLocal.getTime() <= startLocal.getTime()) {
+          endLocal = new Date(endLocal.getTime() + 24*60*60*1000); // overnight
+        }
+        return {
+          cellId: have,
+          site: siteName,
+          siteName,
+          startLocalISO: startLocal ? startLocal.toISOString() : "",
+          endLocalISO:   endLocal   ? endLocal.toISOString()   : ""
+        };
+      }
+    }
   }
   return null;
 }
@@ -556,10 +570,23 @@ async function handleShifts(req, env) {
 
   if (!employeeNumber) return json({ success:false, message:"employeeNumber is required." }, { status:400 });
 
-  // Clamp caller-provided window to <= 30 days
+  // ---- Choose window for WinTeam request (honor dateFrom/dateTo if provided) ----
+  // Default: today ± 10 days (21-day window), always clamp to <30 days when custom range is provided.
   const startBase = nowAnchor();
-  let winFrom = reqDateFrom || ymd(startBase);
-  let winTo   = reqDateTo   || ymd(addDaysUTC(startBase, 15));
+  let winFrom, winTo;
+  
+  if (reqDateFrom && reqDateTo) {
+    const fromD = new Date(reqDateFrom + "T00:00:00Z");
+    const toD   = new Date(reqDateTo   + "T00:00:00Z");
+    const maxTo = new Date(fromD.getTime() + 29*24*60*60*1000); // 29-day cap
+    const toClamped = (toD > maxTo ? maxTo : toD);
+    winFrom = ymd(fromD);
+    winTo   = ymd(toClamped);
+  } else {
+    winFrom = ymd(addDaysUTC(startBase, -10));
+    winTo   = ymd(addDaysUTC(startBase,  +10));
+  }
+  
   if (reqDateFrom && reqDateTo) {
     const fromD = new Date(reqDateFrom + "T00:00:00Z");
     const toD   = new Date(reqDateTo   + "T00:00:00Z");
@@ -793,39 +820,41 @@ async function handleZvaShiftWriteByCell(req, env) {
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
   // ---- Find the shift by cellId ----
+    // ---- Find the shift by cellId ----
   let shift = null;
 
-  // 1) Strict dateHint day window (if present)
-  if (dateHint) {
-    try {
-      const d = new Date(dateHint);
-      if (!isNaN(d)) {
-        const from = ymd(d);
-        const to   = ymd(new Date(d.getTime() + 24*60*60*1000));
-        console.log("ZVA DEBUG writer: dateHint window", { from, to });
-        shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: from, toDate: to });
-        if (!shift) console.log("ZVA DEBUG writer: no hit in dateHint window; trying chunked");
-      }
-    } catch {}
+  // Resolve anchor date (dateHint if present, else today)
+  const anchorYmd = dateHint ? ymdFromISODate(dateHint) : ymd(new Date());
+
+  if (anchorYmd) {
+    // 1) Exact day first
+    const exact = windowExactDay(anchorYmd);
+    console.log("ZVA DEBUG writer: date window exact", exact);
+    shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: exact.from, toDate: exact.to });
   }
 
-  // 2) Chunked search around now (≤30d windows)
-  if (!shift) {
-    try { shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId }); }
-    catch (e) { console.log("ZVA DEBUG writer: chunked WinTeam lookup threw", String(e?.message || e)); }
+  // 2) If not found, try ±10 days around anchor (21-day window, safely < 30)
+  if (!shift && anchorYmd) {
+    const around = windowAround(anchorYmd, 10, 10);
+    console.log("ZVA DEBUG writer: date window around", around);
+    shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: around.from, toDate: around.to });
   }
 
-  // 3) Last resort: via our own 15d endpoint
+  // 3) Last resort: via our own endpoint, still anchored near the same date
   if (!shift) {
     try {
-      shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint });
-      if (!shift) console.log("ZVA DEBUG writer: viaSelf fallback also missed", { employeeNumber, cellId, dateHint });
+      // reuse anchorYmd as the hint so /winteam/shifts looks near that day
+      shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint: anchorYmd });
+      if (!shift) console.log("ZVA DEBUG writer: viaSelf fallback also missed", { employeeNumber, cellId, dateHint: anchorYmd });
     } catch (e) {
       console.log("ZVA DEBUG writer: viaSelf fallback threw", String(e?.message || e));
     }
   }
 
-  if (!shift) return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
+  if (!shift) {
+    return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
+  }
+
 
   const site     = (shift.site || shift.siteName || "").toString().trim();
   const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
