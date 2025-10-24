@@ -328,8 +328,14 @@ function stateFromSupervisor(supervisorDescription = "") {
 }
 
 // Expanded department mapping
+// Expanded department mapping
 function deriveDepartmentFromReason(reasonRaw = "") {
   const r = String(reasonRaw || "").trim();
+
+  // // HR (resignation / quit)
+  // if (/\b(quit|resign|resignation|two[-\s]?weeks|notice|separation|terminate|termination)\b/i.test(r)) {
+  //   return "HR";
+  // }
 
   // Payroll
   if (/\b(payroll|pay\s*(issue|check|stub)|w-?2|withhold|tax)\b/i.test(r)) return "Payroll";
@@ -343,7 +349,8 @@ function deriveDepartmentFromReason(reasonRaw = "") {
     "\\b(late|arriv(?:e|ing)\\s*late|tardy|early\\s*out|leav(?:e|ing)\\s*early)\\b",
     "\\b(time\\s*card|timecard|punch|missed\\s*punch|schedule|swap|shift\\s*change)\\b",
     "\\b(transport|car\\s*(trouble|issue|problem|broke)|bus\\s*delay|uber|lyft|ride\\s*share|flat\\s*tire|traffic)\\b",
-    "\\b(personal\\s*(issue|matter)|family\\s*(issue|emergency|matter)|child|kids?|doctor|dr\\.?|appointment|emergency)\\b"
+    "\\b(personal\\s*(issue|matter)|family\\s*(issue|emergency|matter)|child|kids?|doctor|dr\\.?|appointment|emergency)\\b",
+    "\\b(quit|resign|resignation|two[-\s]?weeks|notice|separation|terminate|termination)\\b"
   ].join("|"), "i");
   if (opsRe.test(r)) return "Operations";
 
@@ -1012,6 +1019,136 @@ async function handleZvaShiftWriteByCell(req, env) {
   }, { status: 200 });
 }
 
+// Resignation writer: no shift, no engagementId required
+async function handleZvaQuitWrite(req, env) {
+  let body = await readJson(req);
+  if (body?.json && typeof body.json === "object") body = body.json;
+  if (body?.data && typeof body.data === "object") body = body.data;
+
+  const s  = (v) => (v == null ? "" : String(v).trim());
+  const employeeNumber = s(body.employeeNumber || body.ofcEmployeeNumber || "");
+  const ofcFullname    = s(body.ofcFullname || body.fullname || body.fullName || "");
+  const aniRaw         = s(body.ani || body.callerId || "");
+  const emailRaw       = s(body.email || body.ofcEmail || "");
+  const reasonRaw      = s(body.callreason || body.reason || "Resignation");
+  const notesExtra     = s(body.notes || body.note || body.details || "");
+  const lastDayHint    = s(body.quitLastDay || body.lastDay || body.dateHint || "");
+  const groupId        = s(body.groupId || ""); // optional Monday group override
+
+  // minimal inputs: employeeNumber OR (fullname + ANI)
+  if (!employeeNumber && !(ofcFullname && aniRaw)) {
+    return json({ success:false, message:"Provide employeeNumber OR (ofcFullname + callerId)." }, { status:400 });
+  }
+
+  // Normalize basics
+  const callerId = normalizeUsPhone(aniRaw);
+  const email    = (function (raw) {
+    const e = String(raw || "").trim();
+    return e && /@/.test(e) ? e : "";
+  })(emailRaw);
+
+  // Determine last day (default: today)
+  const lastDayISO = (function() {
+    if (!lastDayHint) return ymd(new Date());
+    const d = new Date(lastDayHint);
+    return isNaN(d.getTime()) ? ymd(new Date()) : ymd(d);
+  })();
+
+  // Enrich from WinTeam if we have an employeeNumber
+  let employee = null;
+  if (employeeNumber) {
+    try { employee = await fetchEmployeeDetail(employeeNumber, env); } catch {}
+  }
+  const fullName = s(ofcFullname || employee?.fullName || "Unknown Caller");
+
+  // Department + routing
+  const department = "HR"; // force HR for quit flow
+  const deptEmail  = "hr@secureone.com";
+  const division   = stateFromSupervisor(employee?.supervisorDescription || "") || STATE_FULL[(employee?.workstate || "").toUpperCase()] || s(employee?.workstate);
+
+  // Build item
+  const itemName = `${employeeNumber || "UNKNOWN"} | ${fullName} (Resignation)`;
+
+  // Monday board (required)
+  const boardId = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
+  if (!boardId) return json({ success:false, message:"boardId missing (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID in env)." }, { status:400 });
+
+  // Idempotency key (uses KV FLOW_GUARD if bound)
+  const dedupeKey = `quit|${employeeNumber || callerId || "unknown"}|${lastDayISO}`;
+  if (await flowGuardSeen(env, dedupeKey)) {
+    return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false });
+  }
+
+  // Column payload (reuse your builder keys)
+  const nowISO = new Date().toISOString();
+  const cvFriendly = {
+    division,               // will map to Status via builder
+    department,             // -> Status
+    deptEmail,              // -> text
+    reason: [
+      "Resignation",
+      reasonRaw && `Reason: ${reasonRaw}`,
+      `Last day: ${lastDayISO}`,
+      notesExtra && `Notes: ${notesExtra}`
+    ].filter(Boolean).join("\n"),
+    dateTime: nowISO,       // timestamp of intake
+    email: email || employee?.emailAddress || "",
+    phone: employee?.phone1 || "",
+    callerId                // show ANI in its own column
+  };
+  const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
+  const cvString = JSON.stringify(columnValues);
+
+  // Create item
+  const createMutation = `
+    mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
+      create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
+        id name board { id } group { id }
+      }
+    }`;
+  let created;
+  try {
+    const res = await mondayGraphQL(env, createMutation, { boardId, itemName, groupId: groupId || null });
+    created = res.create_item;
+  } catch (e) {
+    return json({ success:false, message:"Monday create_item failed.", detail:String(e) }, { status:502 });
+  }
+
+  // Set columns
+  if (Object.keys(columnValues).length) {
+    const changeMutation = `
+      mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
+        change_multiple_column_values (board_id: $boardId, item_id: $itemId, column_values: $cv) { id name }
+      }`;
+    try {
+      await mondayGraphQL(env, changeMutation, { boardId, itemId: String(created.id), cv: cvString });
+    } catch (e) {
+      return json({ success:false, message:"Monday change_multiple_column_values failed.", createdItem: created, detail:String(e) }, { status:502 });
+    }
+  }
+
+  // Mark idempotent
+  await flowGuardMark(env, dedupeKey);
+
+  // Friendly summary log
+  console.log(`✅ ZVA QUIT SUMMARY: ${pretty({
+    employeeNumber: employeeNumber || null,
+    fullname: fullName,
+    lastDay: lastDayISO,
+    deptEmail,
+    mondayItemId: created?.id || null,
+    dedupeKey
+  })}`);
+
+  return json({
+    success: true,
+    message: "Resignation recorded in Monday.",
+    item: created,
+    dedupeKey,
+    columnValuesSent: columnValues
+  }, { status: 200 });
+}
+
 ///////////////////////////////
 // Router
 ///////////////////////////////
@@ -1038,6 +1175,8 @@ export default {
     if (method === "POST" && path === "/monday/write")            return await handleMondayWrite(req, env);
     if (method === "POST" && path === "/zva/shift-write")         return await handleZvaShiftWrite(req, env);
     if (method === "POST" && path === "/zva/shift-write-by-cell") return await handleZvaShiftWriteByCell(req, env);
+    if (method === "POST" && path === "/zva/quit-write")         return await handleZvaQuitWrite(req, env);
+
 
     return json({ success:false, message:"Not found. Use POST /auth/employee, /winteam/shifts, /monday/write, /zva/shift-write(-by-cell)" }, { status:404 });
   })
