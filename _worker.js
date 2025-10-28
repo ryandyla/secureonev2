@@ -128,6 +128,19 @@ function isResignationish(s) {
   return QUIT_WORDS.some(w => t.includes(w));
 }
 
+function normalizeDepartmentLabel(v = "") {
+  const t = String(v).trim().toLowerCase();
+  if (!t) return "";
+  if (["hr","human resources","human-resources"].includes(t)) return "Human Resources";
+  if (["ops","operations"].includes(t)) return "Operations";
+  if (["payroll"].includes(t)) return "Payroll";
+  if (["training","train"].includes(t)) return "Training";
+  if (["sales"].includes(t)) return "Sales";
+  if (["fingerprint","fingerprinting"].includes(t)) return "Fingerprint";
+  if (["other"].includes(t)) return "Other";
+  return ""; // unknown -> skip setting to avoid Monday error
+}
+
 ///////////////////////////////
 // Logging (PII-safe)
 ///////////////////////////////
@@ -469,7 +482,8 @@ function buildMondayColumnsFromFriendly(body) {
 
   // department
   const explicitDept = String(body.department || "").trim();
-  const dept = explicitDept || deriveDepartmentFromReason(body.callreason || body.reason || "");
+  const deptRaw = explicitDept || deriveDepartmentFromReason(body.callreason || body.reason || "");
+  const dept = normalizeDepartmentLabel(deptRaw);
   if (dept) out[MONDAY_COLUMN_MAP.department] = mondayStatusLabel(dept);
 
   // cleanup
@@ -1102,11 +1116,13 @@ async function handleZvaQuitWrite(req, env) {
     try { employee = await fetchEmployeeDetail(employeeNumber, env); } catch {}
   }
   const fullName = s(ofcFullname || employee?.fullName || "Unknown Caller");
-
+  
   // Department + routing
-  const department = "HR"; // force HR for quit flow
-  const deptEmail  = "hr@secureone.com";
-  const division   = stateFromSupervisor(employee?.supervisorDescription || "") || STATE_FULL[(employee?.workstate || "").toUpperCase()] || s(employee?.workstate);
+  const department = "Operations"; 
+  const deptEmail  = deriveDepartmentEmail(employee?.supervisorDescription || "", department);
+  const division   = stateFromSupervisor(employee?.supervisorDescription || "") 
+                  || STATE_FULL[(employee?.workstate || "").toUpperCase()] 
+                  || s(employee?.workstate);
 
   // Build item
   const itemName = `${employeeNumber || "UNKNOWN"} | ${fullName} (Resignation)`;
