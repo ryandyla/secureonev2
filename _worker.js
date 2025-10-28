@@ -116,6 +116,17 @@ function windowAround(ymdStr, beforeDays = 10, afterDays = 10) {
   return { from, to };
 }
 
+// --- resignation helpers ---
+const QUIT_WORDS = [
+  "quit","resign","resignation","two weeks","2 weeks","notice",
+  "separation","terminate","termination","leaving","last day",
+  "effective immediately"
+];
+function isResignationish(s) {
+  if (!s) return false;
+  const t = String(s).toLowerCase();
+  return QUIT_WORDS.some(w => t.includes(w));
+}
 
 ///////////////////////////////
 // Logging (PII-safe)
@@ -866,8 +877,39 @@ async function handleZvaShiftWriteByCell(req, env) {
   const dateHint       = String(body.dateHint || "").trim();
   const ofctimeinorout = String(body.ofctimeinorout || body.timeinorout || "").trim();
 
-  if (!employeeNumber) return json({ success:false, message:"employeeNumber required" }, { status:400 });
-  if (!cellId)         return json({ success:false, message:"cellId required" }, { status:400 });
+if (!employeeNumber) {
+  return json({ success:false, message:"employeeNumber required" }, { status:400 });
+}
+
+  // Allow resignation flow without a cellId
+  const allowNoCell = isResignationish(reason) || String(body.allow_no_cell || "").toLowerCase() === "true" || !!dateHint;
+  
+  // If no cellId but looks like a resignation, delegate to /zva/quit-write
+  if (!cellId && allowNoCell) {
+    // Build a minimal resignation payload and call the existing quit writer
+    const quitBody = {
+      employeeNumber,
+      ofcFullname: String(body.ofcFullname || body.fullname || body.fullName || ""),
+      callerId: aniRaw,
+      email: String(body.email || body.ofcEmail || ""),
+      callreason: reason || "Resignation",
+      notes: String(body.notes || body.note || body.details || ""),
+      dateHint,                             // “last day” hint if provided
+      groupId: String(body.groupId || "")   // optional Monday group override
+    };
+    const fakeReq = new Request(new URL("/zva/quit-write", req.url).toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(quitBody)
+    });
+    return await handleZvaQuitWrite(fakeReq, env);
+  }
+  
+  // Otherwise, still require a cellId for shift-based writes
+  if (!cellId) {
+    return json({ success:false, message:"cellId required for shift-based calls. (Tip: send resignation text in callreason or pass allow_no_cell=true to use quit flow.)" }, { status:400 });
+  }
+
 
   const normPhone = (raw) => {
     if (!raw) return "";
