@@ -381,25 +381,72 @@ function deriveDepartmentFromReason(reasonRaw = "") {
   return "Other";
 }
 
-// Department email mapping
+// --- Supervisor/Dept → Division & Dept Email helpers ---
+
+// Use in your pipeline like:
+//   const division = deriveDivisionFromSupervisor(supervisorDescription, department);
+//   const deptEmail = deriveDepartmentEmail(supervisorDescription, department);
+
 function deriveDepartmentEmail(supervisorDescription = "", department = "") {
   const sup = String(supervisorDescription || "").trim();
   const dep = String(department || "").trim();
 
-  // Department address wins (explicit)
-  if (/^training$/i.test(dep)) return "training@secureone.com";
-  if (/^payroll$/i.test(dep))  return "payroll@secureone.com";
-  if (/^hr$/i.test(dep))       return "hr@secureone.com";
+  // 1) Explicit department wins
+  if (/^training$/i.test(dep))  return "training@secureone.com";
+  if (/^payroll$/i.test(dep))   return "payroll@secureone.com";
+  if (/^hr$/i.test(dep))        return "hr@secureone.com";
+  if (/^corporate$/i.test(dep)) return "corporate@secureone.com";
 
-  // Ops state teams
-  const OPS_STATES = new Set(["IL","AZ","TX","AL","TN","IN","OH"]);
-  const m = sup.match(/\b(AL|AZ|TX|IL|TN|IN|OH)\b.*\b(Ops|Operations)\b/i);
+  // 2) Corporate supervisors
+  if (/\b(Chris\s+Jackson|Vince\s+Joyce|Jim\s+McGovern)\b/i.test(sup)) {
+    return "corporate@secureone.com";
+  }
+
+  // 3) Ops state teams → {st}opsteam@secureone.com (e.g., ilopsteam@)
+  const OPS_STATES = new Set(["AL","AZ","TX","TN","OH","IN","IL"]);
+  // Match forms like "AZ OPS TEAM", "IL Operations", "... IL - Ops ..."
+  const m = sup.match(/\b(AL|AZ|TX|TN|OH|IN|IL)\b.*\b(Ops|Operations)\b/i);
   if (m) {
     const st = m[1].toUpperCase();
-    if (OPS_STATES.has(st)) return `${st.toLowerCase()}opsteam@secureone.com`; // e.g. ilopsteam@
+    if (OPS_STATES.has(st)) return `${st.toLowerCase()}opsteam@secureone.com`;
   }
+
+  // 4) Default: unknown
   return "";
 }
+
+function deriveDivisionFromSupervisor(supervisorDescription = "", department = "") {
+  const sup = String(supervisorDescription || "").trim();
+  const dep = String(department || "").trim();
+
+  // 1) Explicit department "Corporate" wins
+  if (/^corporate$/i.test(dep)) return "Corporate";
+
+  // 2) Corporate supervisors
+  if (/\b(Chris\s+Jackson|Vince\s+Joyce|Jim\s+McGovern)\b/i.test(sup)) {
+    return "Corporate";
+  }
+
+  // 3) Ops state teams → Full state name + " Division"
+  const STATE_NAME = {
+    AL: "Alabama",
+    AZ: "Arizona",
+    TX: "Texas",
+    TN: "Tennessee",
+    OH: "Ohio",
+    IN: "Indiana",
+    IL: "Illinois",
+  };
+  const m = sup.match(/\b(AL|AZ|TX|TN|OH|IN|IL)\b.*\b(Ops|Operations)\b/i);
+  if (m) {
+    const st = m[1].toUpperCase();
+    if (STATE_NAME[st]) return `${STATE_NAME[st]} Division`;
+  }
+
+  // 4) No inference
+  return "";
+}
+
 
 ///////////////////////////////
 // Builders
