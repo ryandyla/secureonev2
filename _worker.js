@@ -735,7 +735,6 @@ async function handleShifts(req, env) {
   // ---- Choose window for WinTeam request (honor dateFrom/dateTo if provided) ----
   // Default: today ± 10 days (21-day window), always clamp to <30 days when custom range is provided.
   const startBase = nowAnchor();
-  let winFrom, winTo;
   
    // ---- Choose window (honor dateFrom/dateTo if valid; else default ±10d) ----
   const startBase = nowAnchor();
