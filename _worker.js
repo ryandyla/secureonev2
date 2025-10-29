@@ -283,22 +283,44 @@ async function readJson(req) {
 function buildWTHeaders(TENANT_ID, API_KEY) {
   return { tenantId: TENANT_ID, "Ocp-Apim-Subscription-Key": API_KEY, accept: "application/json" };
 }
+
 async function callWinTeamJSON(url, env) {
   const TENANT_ID = env.WINTEAM_TENANT_ID || "";
   const API_KEY = env.WINTEAM_API_KEY || "";
   if (!TENANT_ID || !API_KEY) return { ok:false, status:500, error:"Missing WINTEAM_TENANT_ID or WINTEAM_API_KEY." };
+
   try {
     const r = await fetch(url, { headers: buildWTHeaders(TENANT_ID, API_KEY) });
+
+    const ct = (r.headers.get("content-type") || "").toLowerCase();
+    const raw = await r.text(); // read once
+
+    // Non-2xx → bubble up body (HTML/text) for debugging
     if (!r.ok) {
-      const text = await r.text().catch(()=>"");
-      return { ok:false, status:r.status, error: text.slice(0,1000) };
+      return { ok:false, status:r.status, error: (raw || "").slice(0, 1000) || `HTTP ${r.status}` };
     }
-    const data = await r.json();
-    return { ok:true, data };
+
+    // 204 or empty → treat as empty page, not a JSON parse error
+    if (!raw || r.status === 204) {
+      return { ok:true, data: { data: [] } };
+    }
+
+    // Try JSON parse; if it fails, surface a helpful error
+    try {
+      const data = JSON.parse(raw);
+      return { ok:true, data };
+    } catch (e) {
+      return {
+        ok:false,
+        status:r.status,
+        error:`Non-JSON response (${r.status}) ct=${ct || "n/a"} body=${raw.slice(0, 240)}`
+      };
+    }
   } catch (e) {
     return { ok:false, status:502, error:String(e?.message || e) };
   }
 }
+
 function buildEmployeeURL(employeeNumber) {
   const url = new URL(EMPLOYEE_BASE);
   url.searchParams.set("searchFieldName", "employeeNumber");
@@ -715,25 +737,25 @@ async function handleShifts(req, env) {
   const startBase = nowAnchor();
   let winFrom, winTo;
   
-  if (reqDateFrom && reqDateTo) {
+   // ---- Choose window (honor dateFrom/dateTo if valid; else default ±10d) ----
+  const startBase = nowAnchor();
+
+  function validYmd(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s || "")); }
+
+  let winFrom, winTo;
+  if (validYmd(reqDateFrom) && validYmd(reqDateTo)) {
     const fromD = new Date(reqDateFrom + "T00:00:00Z");
     const toD   = new Date(reqDateTo   + "T00:00:00Z");
-    const maxTo = new Date(fromD.getTime() + 29*24*60*60*1000); // 29-day cap
-    const toClamped = (toD > maxTo ? maxTo : toD);
-    winFrom = ymd(fromD);
-    winTo   = ymd(toClamped);
-  } else {
+    if (!isNaN(fromD) && !isNaN(toD)) {
+      const maxTo = new Date(fromD.getTime() + 29*24*60*60*1000); // <30d cap
+      const toClamped = (toD > maxTo ? maxTo : toD);
+      winFrom = ymd(fromD);
+      winTo   = ymd(toClamped);
+    }
+  }
+  if (!winFrom || !winTo) {
     winFrom = ymd(addDaysUTC(startBase, -10));
     winTo   = ymd(addDaysUTC(startBase,  +10));
-  }
-  
-  if (reqDateFrom && reqDateTo) {
-    const fromD = new Date(reqDateFrom + "T00:00:00Z");
-    const toD   = new Date(reqDateTo   + "T00:00:00Z");
-    const maxTo = new Date(fromD.getTime() + 30*24*60*60*1000);
-    const toClamped = (toD > maxTo ? maxTo : toD);
-    winFrom = ymd(fromD);
-    winTo   = ymd(toClamped);
   }
 
   const wtUrl = new URL(SHIFTS_BASE_EXACT);
