@@ -733,14 +733,12 @@ async function handleShifts(req, env) {
   if (!employeeNumber) return json({ success:false, message:"employeeNumber is required." }, { status:400 });
 
   // ---- Choose window for WinTeam request (honor dateFrom/dateTo if provided) ----
-  // Default: today ± 10 days (21-day window), always clamp to <30 days when custom range is provided.
-  const startBase = nowAnchor();
-  
-   // ---- Choose window (honor dateFrom/dateTo if valid; else default ±10d) ----
   const startBase = nowAnchor();
 
   function validYmd(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s || "")); }
 
+  // Default: today ± 10 days (21-day window), always clamp to <30 days when custom range is provided.
+  // ---- Choose window (honor dateFrom/dateTo if valid; else default ±10d) ----
   let winFrom, winTo;
   if (validYmd(reqDateFrom) && validYmd(reqDateTo)) {
     const fromD = new Date(reqDateFrom + "T00:00:00Z");
