@@ -141,6 +141,20 @@ function normalizeDepartmentLabel(v = "") {
   return ""; // unknown -> skip setting to avoid Monday error
 }
 
+async function mondayFindItemByText(env, { boardId, columnId, value }) {
+  if (!value) return null;
+  const q = `
+    query($boardId:[ID!], $columnId:String!, $value:String!) {
+      items_page(query_params:{ rules:[
+        { column_id:$columnId, operator:contains_text, compare_value:$value }
+      ], board_ids:$boardId }, limit:1) {
+        items { id name }
+      }
+    }`;
+  const d = await mondayGraphQL(env, q, { boardId:[String(boardId)], columnId, value });
+  return d?.items_page?.items?.[0] || null;
+}
+
 ///////////////////////////////
 // Logging (PII-safe)
 ///////////////////////////////
@@ -826,29 +840,116 @@ async function handleMondayWrite(req, env) {
   const body = await readJson(req);
   if (!body) return json({ success:false, message:"Invalid JSON body." }, { status:400 });
 
+  // ---- mode + basics ----
+  const modeRaw = String(body.mode || "").trim().toLowerCase();
+  const mode = (modeRaw === "manual" ? "manual" : "auto");
+
   let engagementId = trim(body.engagementId || body.zoomEngId || body.zoomGuid || "");
   if (engagementId && !body.zoomGuid) body.zoomGuid = engagementId;
 
   const boardId = String(body.boardId || env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) return json({ success:false, message:"boardId is required (env or body)." }, { status:400 });
 
-  const itemName = trim(body.itemName || body.name || "");
-  const groupId  = trim(body.groupId || "");
-  if (!itemName) return json({ success:false, message:"itemName is required." }, { status:400 });
-
+  // item/group naming
+  const ofcFullname = trim(body.ofcFullname || body.fullname || body.fullName || "");
   const employeeNumber = trim(body.employeeNumber || body.ofcEmployeeNumber || "");
+  const callreason = trim(body.callreason || body.reason || "");
+  const ofcPhone   = normalizeUsPhone(trim(body.ofcPhone || body.phone || ""));
+  const ofcEmail   = trim(body.ofcEmail || body.email || "");
+  const callerId   = normalizeUsPhone(trim(body.callerId || body.ANI || body.ani || ofcPhone || ""));
+  const groupId    = trim(body.groupId || ""); // allow override from caller
+
+  // derive a safe itemName if not provided
+  let itemName = trim(body.itemName || body.name || "");
+  if (!itemName) {
+    if (mode === "manual") {
+      itemName = `${ofcFullname || "Unknown"} | Manual Intake`;
+    } else {
+      itemName = `${employeeNumber || ofcFullname || "Unknown"} | Auto`;
+    }
+  }
+
+  // ---- manual mode validation (relaxed) ----
+  if (mode === "manual") {
+    const errs = [];
+    if (!ofcFullname) errs.push("ofcFullname");
+    if (!callreason)  errs.push("callreason");
+    if (!ofcPhone && !ofcEmail && !callerId) errs.push("ofcPhone or ofcEmail");
+    if (errs.length) return json({ success:false, message:"Missing required fields (manual mode).", missing: errs }, { status:400 });
+  }
+
+  // ---- Column values (friendly) ----
+  const cvFriendly = {
+    // whatever was passed already (site, timeInOut, zoomGuid, etc.) will still be mapped:
+    site: body.site,
+    reason: callreason,
+    timeInOut: body.timeInOut || body.ofctimeinorout,
+    startTime: body.startTime,
+    endTime: body.endTime,
+    zoomGuid: engagementId || "",
+    email: ofcEmail,
+    phone: ofcPhone,
+    callerId,
+
+    // if shift text wasn’t provided, drop a helpful note in manual mode
+    shift: body.shift || (mode === "manual" ? "Manual Intake – no shift provided" : undefined),
+
+    // optional labels if you added those columns
+    authResult:  mode === "manual" ? "Manual Intake" : undefined,
+    authAttempts: mode === "manual" ? (Number(body.authFailCount ?? 3) || 3) : undefined,
+
+    // optional routing you already support
+    division: body.division,
+    department: body.department,
+    deptEmail: body.deptEmail,
+    dateTime: body.dateTime || new Date().toISOString()
+  };
+  const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
+
+  // ---- dedupe / idempotency keys ----
   let dedupeKey = trim(body.dedupeKey || "");
   if (!dedupeKey) {
     if (engagementId && employeeNumber) dedupeKey = `${engagementId}:${employeeNumber}`;
     else if (engagementId) dedupeKey = engagementId;
+    else if (callerId) dedupeKey = `manual:${callerId}:${new Date().toISOString().slice(0,13)}`; // hourly bucket
   }
 
-  const columnValues = buildMondayColumnsFromFriendly(body);
-
+  // KV dedupe still honored (fast path)
   if (dedupeKey && (await flowGuardSeen(env, dedupeKey))) {
-    return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false, item:null, columnValues });
+    return json({ success:true, message:"Duplicate suppressed by flow guard.", mode, dedupeKey, upserted:false, item:null, columnValues });
   }
 
+  // ---- UPSERT by Zoom GUID first (if present) ----
+  let targetItemId = null;
+  if (engagementId && MONDAY_COLUMN_MAP.zoomGuid) {
+    try {
+      const hit = await mondayFindItemByText(env, { boardId, columnId: MONDAY_COLUMN_MAP.zoomGuid, value: engagementId });
+      if (hit?.id) targetItemId = String(hit.id);
+    } catch (e) {
+      // non-fatal; continue
+      console.log("UPSERT lookup by zoomGuid failed:", String(e?.message || e));
+    }
+  }
+
+  // ---- Update or Create ----
+  const cvString = JSON.stringify(columnValues);
+
+  if (targetItemId) {
+    // UPDATE in place
+    const changeMutation = `
+      mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
+        change_multiple_column_values (board_id: $boardId, item_id: $itemId, column_values: $cv) { id name }
+      }`;
+    try {
+      await mondayGraphQL(env, changeMutation, { boardId, itemId: targetItemId, cv: cvString });
+    } catch (e) {
+      return json({ success:false, message:"Monday update (UPSERT) failed.", detail:String(e), itemId: targetItemId }, { status:502 });
+    }
+    if (dedupeKey) await flowGuardMark(env, dedupeKey);
+    return json({ success:true, message:"Monday item updated (UPSERT).", mode, boardId, item: { id: targetItemId }, dedupeKey, engagementId, columnValuesSent: columnValues });
+  }
+
+  // CREATE new
   const createMutation = `
     mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
       create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
@@ -869,7 +970,7 @@ async function handleMondayWrite(req, env) {
         change_multiple_column_values (board_id: $boardId, item_id: $itemId, column_values: $cv) { id name }
       }`;
     try {
-      await mondayGraphQL(env, changeMutation, { boardId, itemId: String(created.id), cv: JSON.stringify(columnValues) });
+      await mondayGraphQL(env, changeMutation, { boardId, itemId: String(created.id), cv: cvString });
     } catch (e) {
       return json({ success:false, message:"Monday change_multiple_column_values failed.", createdItem: created, detail:String(e) }, { status:502 });
     }
@@ -877,7 +978,7 @@ async function handleMondayWrite(req, env) {
 
   if (dedupeKey) await flowGuardMark(env, dedupeKey);
 
-  return json({ success:true, message:"Monday item created/updated.", boardId, item: created, dedupeKey: dedupeKey || null, engagementId: engagementId || null, columnValuesSent: columnValues });
+  return json({ success:true, message:"Monday item created/updated.", mode, boardId, item: created, dedupeKey: dedupeKey || null, engagementId: engagementId || null, columnValuesSent: columnValues });
 }
 
 // Legacy write (by selection index) — unchanged logic aside from ANI alias & timeInOut alias handled in builder
