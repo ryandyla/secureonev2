@@ -1057,6 +1057,7 @@ async function handleZvaShiftWrite(req, env) {
 }
 
 // Preferred: write by cellId (with dateHint day window + chunked fallbacks)
+// Preferred: write by cellId (with dateHint day window + chunked fallbacks)
 async function handleZvaShiftWriteByCell(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -1070,16 +1071,18 @@ async function handleZvaShiftWriteByCell(req, env) {
   const dateHint       = String(body.dateHint || "").trim();
   const ofctimeinorout = String(body.ofctimeinorout || body.timeinorout || "").trim();
 
-if (!employeeNumber) {
-  return json({ success:false, message:"employeeNumber required" }, { status:400 });
-}
+  if (!employeeNumber) {
+    return json({ success:false, message:"employeeNumber required" }, { status:400 });
+  }
 
-  // Allow resignation flow without a cellId
-  const allowNoCell = isResignationish(reason) || String(body.allow_no_cell || "").toLowerCase() === "true" || !!dateHint;
-  
-  // If no cellId but looks like a resignation, delegate to /zva/quit-write
-  if (!cellId && allowNoCell) {
-    // Build a minimal resignation payload and call the existing quit writer
+  // Only allow a no-cellId write to quit flow if:
+  //  - reason looks like resignation, OR
+  //  - caller explicitly set allow_no_cell=true.
+  const explicitAllowNoCell = String(body.allow_no_cell || "").toLowerCase() === "true";
+  const allowQuitNoCell = isResignationish(reason) || explicitAllowNoCell;
+
+  // If no cellId but looks like resignation, delegate to quit writer
+  if (!cellId && allowQuitNoCell) {
     const quitBody = {
       employeeNumber,
       ofcFullname: String(body.ofcFullname || body.fullname || body.fullName || ""),
@@ -1087,8 +1090,8 @@ if (!employeeNumber) {
       email: String(body.email || body.ofcEmail || ""),
       callreason: reason || "Resignation",
       notes: String(body.notes || body.note || body.details || ""),
-      dateHint,                             // “last day” hint if provided
-      groupId: String(body.groupId || "")   // optional Monday group override
+      dateHint,                           // “last day” hint if provided
+      groupId: String(body.groupId || "") // optional Monday group override
     };
     const fakeReq = new Request(new URL("/zva/quit-write", req.url).toString(), {
       method: "POST",
@@ -1097,12 +1100,14 @@ if (!employeeNumber) {
     });
     return await handleZvaQuitWrite(fakeReq, env);
   }
-  
-  // Otherwise, still require a cellId for shift-based writes
-  if (!cellId) {
-    return json({ success:false, message:"cellId required for shift-based calls. (Tip: send resignation text in callreason or pass allow_no_cell=true to use quit flow.)" }, { status:400 });
-  }
 
+  // From here on, cellId is REQUIRED for shift-based writes.
+  if (!cellId) {
+    return json({
+      success:false,
+      message:"cellId required for shift-based calls. (Tip: use your tool’s manual intake path for callers without a shift selection, or pass allow_no_cell=true only when it is truly a resignation.)"
+    }, { status:400 });
+  }
 
   const normPhone = (raw) => {
     if (!raw) return "";
@@ -1123,7 +1128,6 @@ if (!employeeNumber) {
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
   // ---- Find the shift by cellId ----
-    // ---- Find the shift by cellId ----
   let shift = null;
 
   // Resolve anchor date (dateHint if present, else today)
@@ -1136,10 +1140,9 @@ if (!employeeNumber) {
     shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: exact.from, toDate: exact.to });
   }
 
-  // 2) If not found, try ±10 days around anchor (21-day window, safely < 30)
+  // 2) If not found, try ±14 days around anchor (29-day window, <30 cap)
   if (!shift && anchorYmd) {
-    const around = windowAround(anchorYmd, 14, 14); // 29-day window (safe under WinTeam's <30d cap)
-
+    const around = windowAround(anchorYmd, 14, 14);
     console.log("ZVA DEBUG writer: date window around", around);
     shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: around.from, toDate: around.to });
   }
@@ -1147,7 +1150,6 @@ if (!employeeNumber) {
   // 3) Last resort: via our own endpoint, still anchored near the same date
   if (!shift) {
     try {
-      // reuse anchorYmd as the hint so /winteam/shifts looks near that day
       shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint: anchorYmd });
       if (!shift) console.log("ZVA DEBUG writer: viaSelf fallback also missed", { employeeNumber, cellId, dateHint: anchorYmd });
     } catch (e) {
@@ -1158,7 +1160,6 @@ if (!employeeNumber) {
   if (!shift) {
     return json({ success:false, message:"Shift not found by cellId." }, { status:404 });
   }
-
 
   const site     = (shift.site || shift.siteName || "").toString().trim();
   const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
@@ -1180,11 +1181,11 @@ if (!employeeNumber) {
 
   const cvFriendly = {
     site,
-    reason,
+    reason: reason,
     callerId,
     startTime: startNice,
     endTime: endNice,
-    timeInOut: ofctimeinorout,             // <-- normalized key
+    timeInOut: ofctimeinorout,
     zoomGuid: engagementId || "",
     shift: `${startNice} → ${endNice} @ ${site || ""}`.trim(),
     division,
@@ -1226,7 +1227,6 @@ if (!employeeNumber) {
 
   if (dedupeKey) await flowGuardMark(env, dedupeKey);
 
-  // Friendly one-liner for demos / customers
   try {
     const summary = {
       employeeNumber,
@@ -1240,7 +1240,6 @@ if (!employeeNumber) {
       mondayItemId: created?.id || null,
       dedupeKey
     };
-    // emoji badges make it pop in tail output; still PII-safe due to upstream masking
     console.log(`✅ ZVA SUMMARY: ${pretty(summary)}`);
   } catch (e) {
     console.log("ZVA SUMMARY build error", String(e && e.message || e));
