@@ -515,6 +515,11 @@ function buildMondayColumnsFromFriendly(body) {
   addIf("zoomGuid");
   addIf("shift");
 
+  // Alias: ofcWorksite -> site column if 'site' wasn’t explicitly set
+  if (!out[MONDAY_COLUMN_MAP.site] && body.ofcWorksite) {
+    out[MONDAY_COLUMN_MAP.site] = String(body.ofcWorksite).trim();
+  }
+
   if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
 
   // email
@@ -546,24 +551,39 @@ function buildMondayColumnsFromFriendly(body) {
     }
   }
 
-  // division (explicit or derived)
+  // ----- Division from explicit or derived state (prefer ofcWorkstate first) -----
   const explicitDivision = String(body.division || "").trim();
+
   let derivedDivision = "";
   if (!explicitDivision) {
-    derivedDivision = stateFromSupervisor(body.supervisorDescription);
-    if (!derivedDivision) {
-      const rawState = String(body.ofcWorkstate || body.workState || body.state || "").trim();
+    let rawState = String(
+      body.ofcWorkstate || body.workState || body.state || body.ofcWorkState || body.ofcWork_state || ""
+    ).trim();
+
+    if (rawState) {
       if (rawState.length === 2 && STATE_FULL[rawState.toUpperCase()]) {
         derivedDivision = STATE_FULL[rawState.toUpperCase()];
-      } else if (rawState) {
+      } else {
         derivedDivision = rawState;
+      }
+    }
+
+    if (!derivedDivision) {
+      derivedDivision = stateFromSupervisor(body.supervisorDescription);
+    }
+    if (!derivedDivision) {
+      const rs = String(body.ofcWorkstate || body.workState || body.state || "").trim();
+      if (rs.length === 2 && STATE_FULL[rs.toUpperCase()]) {
+        derivedDivision = STATE_FULL[rs.toUpperCase()];
+      } else if (rs) {
+        derivedDivision = rs;
       }
     }
   }
   const finalDivision = explicitDivision || derivedDivision;
   if (finalDivision) out[MONDAY_COLUMN_MAP.division] = mondayStatusLabel(finalDivision);
 
-  // department
+  // ----- Department (existing behavior) -----
   const explicitDept = String(body.department || "").trim();
   const deptRaw = explicitDept || deriveDepartmentFromReason(body.callreason || body.reason || "");
   const dept = normalizeDepartmentLabel(deptRaw);
@@ -840,7 +860,6 @@ async function handleMondayWrite(req, env) {
   const body = await readJson(req);
   if (!body) return json({ success:false, message:"Invalid JSON body." }, { status:400 });
 
-  // ---- mode + basics ----
   const modeRaw = String(body.mode || "").trim().toLowerCase();
   const mode = (modeRaw === "manual" ? "manual" : "auto");
 
@@ -850,26 +869,19 @@ async function handleMondayWrite(req, env) {
   const boardId = String(body.boardId || env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) return json({ success:false, message:"boardId is required (env or body)." }, { status:400 });
 
-  // item/group naming
-  const ofcFullname = trim(body.ofcFullname || body.fullname || body.fullName || "");
   const employeeNumber = trim(body.employeeNumber || body.ofcEmployeeNumber || "");
-  const callreason = trim(body.callreason || body.reason || "");
-  const ofcPhone   = normalizeUsPhone(trim(body.ofcPhone || body.phone || ""));
-  const ofcEmail   = trim(body.ofcEmail || body.email || "");
-  const callerId   = normalizeUsPhone(trim(body.callerId || body.ANI || body.ani || ofcPhone || ""));
-  const groupId    = trim(body.groupId || ""); // allow override from caller
+  const callreason     = trim(body.callreason || body.reason || "");
+  const ofcPhone       = normalizeUsPhone(trim(body.ofcPhone || body.phone || ""));
+  const ofcEmail       = trim(body.ofcEmail || body.email || "");
+  const callerId       = normalizeUsPhone(trim(body.callerId || body.ANI || body.ani || ofcPhone || ""));
+  const groupId        = trim(body.groupId || ""); // optional; same group used regardless
 
-  // derive a safe itemName if not provided
-  let itemName = trim(body.itemName || body.name || "");
-  if (!itemName) {
-    if (mode === "manual") {
-      itemName = `${ofcFullname || "Unknown"} | Manual Intake`;
-    } else {
-      itemName = `${employeeNumber || ofcFullname || "Unknown"} | Auto`;
-    }
-  }
+  // manual details & location
+  const ofcFullname  = trim(body.ofcFullname || body.fullname || body.fullName || "");
+  const ofcWorkstate = trim(body.ofcWorkstate || body.workState || body.state || "");
+  const ofcWorksite  = trim(body.ofcWorksite  || body.site || "");
 
-  // ---- manual mode validation (relaxed) ----
+  // Manual validation
   if (mode === "manual") {
     const errs = [];
     if (!ofcFullname) errs.push("ofcFullname");
@@ -878,10 +890,21 @@ async function handleMondayWrite(req, env) {
     if (errs.length) return json({ success:false, message:"Missing required fields (manual mode).", missing: errs }, { status:400 });
   }
 
-  // ---- Column values (friendly) ----
+  // Item name policy (same board/group for both)
+  let itemName = trim(body.itemName || body.name || "");
+  if (!itemName) {
+    if (mode === "manual") {
+      itemName = `${ofcFullname || "Unknown"} (NO AUTH)`; // NO AUTH naming
+    } else {
+      itemName = `${employeeNumber || ofcFullname || "Unknown"} | Auto`;
+    }
+  }
+
+  // Friendly → columns (no extra/manual-only columns)
   const cvFriendly = {
-    // whatever was passed already (site, timeInOut, zoomGuid, etc.) will still be mapped:
-    site: body.site,
+    ofcWorkstate,                // → Division via builder
+    ofcWorksite,                 // → Account/Site via alias
+    site: body.site,             // explicit site still honored
     reason: callreason,
     timeInOut: body.timeInOut || body.ofctimeinorout,
     startTime: body.startTime,
@@ -890,15 +913,8 @@ async function handleMondayWrite(req, env) {
     email: ofcEmail,
     phone: ofcPhone,
     callerId,
-
-    // if shift text wasn’t provided, drop a helpful note in manual mode
     shift: body.shift || (mode === "manual" ? "Manual Intake – no shift provided" : undefined),
 
-    // optional labels if you added those columns
-    authResult:  mode === "manual" ? "Manual Intake" : undefined,
-    authAttempts: mode === "manual" ? (Number(body.authFailCount ?? 3) || 3) : undefined,
-
-    // optional routing you already support
     division: body.division,
     department: body.department,
     deptEmail: body.deptEmail,
@@ -906,36 +922,32 @@ async function handleMondayWrite(req, env) {
   };
   const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
 
-  // ---- dedupe / idempotency keys ----
+  // Dedupe key
   let dedupeKey = trim(body.dedupeKey || "");
   if (!dedupeKey) {
     if (engagementId && employeeNumber) dedupeKey = `${engagementId}:${employeeNumber}`;
     else if (engagementId) dedupeKey = engagementId;
-    else if (callerId) dedupeKey = `manual:${callerId}:${new Date().toISOString().slice(0,13)}`; // hourly bucket
+    else if (callerId) dedupeKey = `manual:${callerId}:${new Date().toISOString().slice(0,13)}`;
   }
 
-  // KV dedupe still honored (fast path)
   if (dedupeKey && (await flowGuardSeen(env, dedupeKey))) {
     return json({ success:true, message:"Duplicate suppressed by flow guard.", mode, dedupeKey, upserted:false, item:null, columnValues });
   }
 
-  // ---- UPSERT by Zoom GUID first (if present) ----
+  // Optional UPSERT by Zoom GUID if present
   let targetItemId = null;
   if (engagementId && MONDAY_COLUMN_MAP.zoomGuid) {
     try {
       const hit = await mondayFindItemByText(env, { boardId, columnId: MONDAY_COLUMN_MAP.zoomGuid, value: engagementId });
       if (hit?.id) targetItemId = String(hit.id);
     } catch (e) {
-      // non-fatal; continue
       console.log("UPSERT lookup by zoomGuid failed:", String(e?.message || e));
     }
   }
 
-  // ---- Update or Create ----
   const cvString = JSON.stringify(columnValues);
 
   if (targetItemId) {
-    // UPDATE in place
     const changeMutation = `
       mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
         change_multiple_column_values (board_id: $boardId, item_id: $itemId, column_values: $cv) { id name }
@@ -949,7 +961,7 @@ async function handleMondayWrite(req, env) {
     return json({ success:true, message:"Monday item updated (UPSERT).", mode, boardId, item: { id: targetItemId }, dedupeKey, engagementId, columnValuesSent: columnValues });
   }
 
-  // CREATE new
+  // CREATE (same group either way)
   const createMutation = `
     mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
       create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
