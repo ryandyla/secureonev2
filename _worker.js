@@ -1269,10 +1269,44 @@ async function verifyEmployeeSSN(env, { employeeNumber, ssnLast4 }) {
   return { ok:true, match: String(match.partialSSN || "").trim() === String(ssnLast4).trim(), raw: match };
 }
 
-// --- /zva/absence-write ---
-// Auto path: prefers selectedCellId/cellId; else resolves from friendly date → earliest shift.
-// Manual path only if neither is available.
+// --- helper: get earliest shift on a specific YMD via self /winteam/shifts
+async function fetchEarliestShiftOnDateViaSelf(req, env, { employeeNumber, ymdDay }) {
+  if (!employeeNumber || !ymdDay) return null;
+
+  const origin = new URL(req.url).origin;
+  const body = { employeeNumber, dateFrom: ymdDay, dateTo: ymdAdd(ymdDay, 1), pageStart: 0 };
+
+  let j;
+  try {
+    const r = await fetch(`${origin}/winteam/shifts`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    const text = await r.text();
+    j = JSON.parse(text);
+  } catch (e) {
+    console.log("ZVA DEBUG earliestOnDate: fetch to /winteam/shifts threw", String(e?.message || e));
+    return null;
+  }
+
+  const arr = Array.isArray(j?.entries) ? j.entries : (Array.isArray(j?.entries_page) ? j.entries_page : []);
+  if (!arr.length) return null;
+
+  // entries are already sorted by start time in /winteam/shifts
+  const first = arr[0];
+  return {
+    cellId: String(first.cellId || "").trim(),
+    site: String(first.site || first.siteName || "").trim(),
+    siteName: String(first.site || first.siteName || "").trim(),
+    startLocalISO: String(first.startLocalISO || first.startIso || "").trim(),
+    endLocalISO:   String(first.endLocalISO   || first.endIso   || "").trim()
+  };
+}
+
+// --- /zva/absence-write (UPGRADED) ---
 async function handleZvaAbsenceWrite(req, env) {
+  // Read + normalize
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
   if (body?.data && typeof body.data === "object") body = body.data;
@@ -1285,21 +1319,45 @@ async function handleZvaAbsenceWrite(req, env) {
   const callreason     = S(body.callreason || body.reason || "Call off / absence");
   const notes          = S(body.notes || body.note || body.details || "");
   const dateHintRaw    = S(body.dateHint || body.fromDate || body.date || "");
-  const selCellId      = S(body.selectedCellId || body.cellId || "");
+  const selectedCellId = S(body.selectedCellId || body.cellId || body.selectedCellID || "");
+
+  // Optional free-text when no shift match
+  const siteHint       = S(body.siteHint || body.site || body.location || "");
+  const startTimeFree  = S(body.startTime || "");
+  const endTimeFree    = S(body.endTime || "");
+  const hours          = S(body.hours || "");
 
   const groupId        = S(body.groupId || "");
   const boardId        = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) return json({ success:false, message:"boardId missing (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID in env)." }, { status:400 });
 
+  // Identity: employeeNumber OR (name + ANI)
   if (!employeeNumber && !(ofcFullname && aniRaw)) {
     return json({ success:false, message:"Provide employeeNumber OR (ofcFullname + callerId)." }, { status:400 });
   }
 
+  // Normalize basics
   const callerId = normalizeUsPhone(aniRaw);
-  const email    = (function (raw) { const e = String(raw || "").trim(); return e && /@/.test(e) ? e : ""; })(emailRaw);
+  const email    = (() => {
+    const e = String(emailRaw || "").trim();
+    return e && /@/.test(e) ? e : "";
+  })();
 
-  const friendlyYmd = dateHintRaw ? parseFriendlyDate(dateHintRaw) : "";
+  // Friendly date -> YYYY-MM-DD (supports today/tomorrow/yesterday/11/5 etc.)
+  const dateHint = (() => {
+    const s = dateHintRaw;
+    if (!s) return "";
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+    const kw = s.toLowerCase();
+    const base = new Date();
+    if (kw === "today")    return ymd(base);
+    if (kw === "tomorrow") return ymd(addDaysUTC(base, 1));
+    if (kw === "yesterday")return ymd(addDaysUTC(base, -1));
+    const d = new Date(s);
+    return isNaN(d) ? "" : ymd(d);
+  })();
 
+  // Enrich via WinTeam if we have an employee number
   let employee = null;
   if (employeeNumber) {
     try { employee = await fetchEmployeeDetail(employeeNumber, env); } catch {}
@@ -1311,61 +1369,69 @@ async function handleZvaAbsenceWrite(req, env) {
   const department = "Operations";
   const deptEmail  = deriveDepartmentEmail(employee?.supervisorDescription || "", department);
 
-  let site = S(body.siteHint || body.site || body.location || "");
-  let startISO = "", endISO = "", autoNote = "";
+  // ---------- Resolve shift context ----------
+  let shiftCtx = null;
 
-  if (selCellId) {
-    try {
-      const anchor = friendlyYmd || ymd(new Date());
-      let shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId: selCellId, fromDate: anchor, toDate: ymdAdd(anchor, 1) });
-      if (!shift) {
-        const around = windowAround(anchor, 14, 14);
-        shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId: selCellId, fromDate: around.from, toDate: around.to });
+  // 1) If a cell was selected in the agent, honor it
+  if (selectedCellId) {
+    const anchorYmd = dateHint || ymd(new Date()); // prefer friendly anchor; else today
+    // exact day first
+    shiftCtx = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId: selectedCellId, fromDate: anchorYmd, toDate: ymdAdd(anchorYmd, 1) });
+    // ±14d around if not found
+    if (!shiftCtx) {
+      const around = windowAround(anchorYmd, 14, 14);
+      shiftCtx = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId: selectedCellId, fromDate: around.from, toDate: around.to });
+    }
+    // last resort: via self (still anchored near anchorYmd)
+    if (!shiftCtx) {
+      try {
+        shiftCtx = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId: selectedCellId, dateHint: anchorYmd });
+      } catch (e) {
+        console.log("ZVA DEBUG absence: viaSelf fallback threw", String(e?.message || e));
       }
-      if (!shift) {
-        shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId: selCellId, dateHint: anchor });
-      }
-      if (shift) {
-        site = site || S(shift.site || shift.siteName || "");
-        startISO = S(shift.startLocalISO || "");
-        endISO   = S(shift.endLocalISO   || "");
-        autoNote = "Auto — shift matched by cellId";
-      }
-    } catch {}
-  }
-
-  if (!startISO && !endISO && !selCellId && friendlyYmd) {
-    const hit = await fetchShiftByDateViaSelf(req, env, { employeeNumber, ymdDate: friendlyYmd }).catch(() => null);
-    if (hit) {
-      site = site || S(hit.site || "");
-      startISO = S(hit.startLocalISO || "");
-      endISO   = S(hit.endLocalISO   || "");
-      autoNote = "Auto — earliest shift on requested date";
     }
   }
 
-  const startNice = startISO ? fmtYmdHmUTC(startISO) : S(body.startTime || "");
-  const endNice   = endISO   ? fmtYmdHmUTC(endISO)   : S(body.endTime   || "");
-  const hours     = S(body.hours || "");
+  // 2) If no selected cell but we have a friendly date, auto-pick earliest shift that day
+  if (!shiftCtx && dateHint && employeeNumber) {
+    shiftCtx = await fetchEarliestShiftOnDateViaSelf(req, env, { employeeNumber, ymdDay: dateHint });
+  }
 
-  const who = employeeNumber ? `${employeeNumber} | ${fullName}` : fullName || callerId || "Unknown";
-  const itemName = `${who} (Call Off)${friendlyYmd ? ` — ${friendlyYmd}` : ""}`;
+  // ---------- Build Monday payload ----------
+  const nowISO    = new Date().toISOString();
+  const itemWho   = employeeNumber ? `${employeeNumber} | ${fullName}` : fullName || callerId || "Unknown";
+  const itemName  = `${itemWho} (Call Off)${dateHint ? ` — ${dateHint}` : ""}`;
 
-  const nowISO = new Date().toISOString();
+  let siteForCv = siteHint;
+  let startNice = "";
+  let endNice   = "";
+
+  if (shiftCtx) {
+    siteForCv = shiftCtx.site || shiftCtx.siteName || siteForCv;
+    startNice = fmtYmdHmUTC(shiftCtx.startLocalISO);
+    endNice   = fmtYmdHmUTC(shiftCtx.endLocalISO);
+  } else {
+    // No shift: allow free-text start/end if provided
+    startNice = startTimeFree;
+    endNice   = endTimeFree;
+  }
+
+  const reasonBlock = [
+    "Absence / Call Off",
+    `Reason: ${callreason}`,
+    dateHint ? `Date: ${dateHint}` : null,
+    siteForCv ? `Site: ${siteForCv}` : null,
+    (startNice || endNice) ? `Time: ${startNice || "?"} → ${endNice || "?"}` : null,
+    hours ? `Hours: ${hours}` : null,
+    notes ? `Notes: ${notes}` : null
+  ].filter(Boolean).join("\n");
+
   const cvFriendly = {
     division,
     department,
     deptEmail,
-    reason: [
-      "Absence / Call Off",
-      `Reason: ${callreason}`,
-      friendlyYmd ? `Date: ${friendlyYmd}` : null,
-      site ? `Site: ${site}` : null,
-      (startNice || endNice) ? `Time: ${startNice || "?"} → ${endNice || "?"}` : null,
-      hours ? `Hours: ${hours}` : null,
-      notes ? `Notes: ${notes}` : null
-    ].filter(Boolean).join("\n"),
-    site,
+    reason: reasonBlock,
+    site: siteForCv,
     startTime: startNice,
     endTime: endNice,
     zoomGuid: "",
@@ -1373,19 +1439,21 @@ async function handleZvaAbsenceWrite(req, env) {
     phone: employee?.phone1 || "",
     callerId,
     dateTime: nowISO,
-    shift: (startNice || endNice || selCellId)
-      ? (autoNote || "Auto — inferred shift")
+    shift: shiftCtx
+      ? `${startNice} → ${endNice} @ ${siteForCv || ""}`.trim()
       : "Manual Intake – no shift provided"
   };
   const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
   const cvString = JSON.stringify(columnValues);
 
+  // Dedupe: employee/name + date + reason (normalized)
   const deKeyWho = (employeeNumber || fullName || callerId || "unknown").toLowerCase();
-  const dedupeKey = `absence|${deKeyWho}|${(friendlyYmd || "nodate")}|${callreason.toLowerCase().slice(0,24)}`;
+  const dedupeKey = `absence|${deKeyWho}|${(dateHint || "nodate")}|${callreason.toLowerCase().slice(0,24)}`;
   if (await flowGuardSeen(env, dedupeKey)) {
     return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false });
   }
 
+  // Create Monday item
   const createMutation = `
     mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
       create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
@@ -1414,12 +1482,14 @@ async function handleZvaAbsenceWrite(req, env) {
 
   await flowGuardMark(env, dedupeKey);
 
+  // Friendly summary log
   try {
     console.log(`✅ ZVA ABSENCE SUMMARY: ${JSON.stringify({
       employeeNumber: employeeNumber || null,
       fullname: fullName,
-      date: friendlyYmd || null,
-      siteHint: site || null,
+      date: dateHint || (shiftCtx?.startLocalISO || "").slice(0,10) || null,
+      siteHint: siteForCv || null,
+      selectedCellId: selectedCellId || null,
       mondayItemId: created?.id || null,
       dedupeKey
     }, null, 2)}`);
