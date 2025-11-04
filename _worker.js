@@ -5,6 +5,8 @@
 //  - POST /monday/write
 //  - POST /zva/shift-write
 //  - POST /zva/shift-write-by-cell
+//  - POST /zva/quit-write
+//  - POST /zva/absence-write
 //
 // Required secrets: WINTEAM_TENANT_ID, WINTEAM_API_KEY, MONDAY_API_KEY
 // Optional secrets: MONDAY_BOARD_ID, MONDAY_DEFAULT_BOARD_ID, FLOW_GUARD_TTL_SECONDS
@@ -116,6 +118,85 @@ function windowAround(ymdStr, beforeDays = 10, afterDays = 10) {
   return { from, to };
 }
 
+// --- Friendly date parser & helpers ---
+const WD = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"];
+function _ymdFromDate(d) {
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,"0")}-${String(d.getUTCDate()).padStart(2,"0")}`;
+}
+function parseFriendlyDate(input, baseDate = new Date()) {
+  const s = String(input || "").trim().toLowerCase();
+  if (!s) return "";
+
+  if (s === "today") return _ymdFromDate(baseDate);
+  if (s === "tomorrow") return _ymdFromDate(addDaysUTC(baseDate, 1));
+  if (s === "yesterday") return _ymdFromDate(addDaysUTC(baseDate, -1));
+
+  const nx = s.match(/^(next|this)\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday)$/i);
+  if (nx) {
+    const [, which, day] = nx;
+    const target = WD.indexOf(day.toLowerCase());
+    if (target >= 0) {
+      const base = new Date(Date.UTC(baseDate.getUTCFullYear(), baseDate.getUTCMonth(), baseDate.getUTCDate()));
+      const cur = base.getUTCDay();
+      let delta = (target - cur);
+      if (which.toLowerCase() === "next") {
+        if (delta <= 0) delta += 7;
+        else delta += 7;
+      } else {
+        if (delta < 0) delta = 0;
+      }
+      const res = addDaysUTC(base, delta);
+      return _ymdFromDate(res);
+    }
+  }
+
+  const md = s.match(/^(\d{1,2})[\/\-](\d{1,2})$/);
+  if (md) {
+    const y = baseDate.getUTCFullYear();
+    const m = +md[1], d = +md[2];
+    const t = Date.UTC(y, m-1, d);
+    const res = new Date(t);
+    if (!isNaN(res)) return _ymdFromDate(res);
+  }
+
+  const mon = s.match(/^(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+(\d{1,2})$/i);
+  if (mon) {
+    const map = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,sept:8,oct:9,nov:10,dec:11};
+    const y = baseDate.getUTCFullYear();
+    const M = map[mon[1].slice(0,3).toLowerCase()];
+    const d = +mon[2];
+    const res = new Date(Date.UTC(y, M, d));
+    if (!isNaN(res)) return _ymdFromDate(res);
+  }
+
+  const dt = new Date(input);
+  if (!isNaN(dt)) return _ymdFromDate(dt);
+
+  return "";
+}
+
+async function fetchShiftByDateViaSelf(req, env, { employeeNumber, ymdDate }) {
+  if (!employeeNumber || !ymdDate) return null;
+  const origin = new URL(req.url).origin;
+  const r = await fetch(`${origin}/winteam/shifts`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ employeeNumber, dateFrom: ymdDate, dateTo: ymdAdd(ymdDate, 1) })
+  });
+  const j = await r.json().catch(() => ({}));
+  const list = Array.isArray(j?.entries) ? j.entries : (Array.isArray(j?.entries_page) ? j.entries_page : []);
+  if (!list.length) return null;
+
+  list.sort((a,b) => Date.parse(a.startLocalISO || "") - Date.parse(b.startLocalISO || ""));
+  const e = list[0];
+  return e ? {
+    cellId: String(e.cellId || "").trim(),
+    site:   String(e.site || e.siteName || "").trim(),
+    startLocalISO: String(e.startLocalISO || "").trim(),
+    endLocalISO:   String(e.endLocalISO   || "").trim()
+  } : null;
+}
+
 // --- resignation helpers ---
 const QUIT_WORDS = [
   "quit","resign","resignation","two weeks","2 weeks","notice",
@@ -138,7 +219,7 @@ function normalizeDepartmentLabel(v = "") {
   if (["sales"].includes(t)) return "Sales";
   if (["fingerprint","fingerprinting"].includes(t)) return "Fingerprint";
   if (["other"].includes(t)) return "Other";
-  return ""; // unknown -> skip setting to avoid Monday error
+  return "";
 }
 
 async function mondayFindItemByText(env, { boardId, columnId, value }) {
@@ -176,11 +257,8 @@ function maskPII(str) {
   s = s.replace(/("ssnLast4"\s*:\s*")(\d{0,4})(")/gi, (_, a, b, c) => a + (b ? "***" + b.slice(-1) : "***") + c);
   return s;
 }
-
 function summarizePayload(payload, { maxArray = 5, maxString = 400 } = {}) {
-  // Returns a JSON-serializable copy with large arrays/strings truncated for readability
   const seen = new WeakSet();
-
   function walk(v) {
     if (v == null) return v;
     if (typeof v === "string") {
@@ -188,28 +266,20 @@ function summarizePayload(payload, { maxArray = 5, maxString = 400 } = {}) {
       return s.length > maxString ? s.slice(0, maxString) + "…(+)" : s;
     }
     if (typeof v !== "object") return v;
-
     if (seen.has(v)) return "[Circular]";
     seen.add(v);
-
     if (Array.isArray(v)) {
       const out = v.slice(0, maxArray).map(walk);
       if (v.length > maxArray) out.push(`…and ${v.length - maxArray} more`);
       return out;
     }
-
     const out = {};
-    for (const k of Object.keys(v)) {
-      out[k] = walk(v[k]);
-    }
+    for (const k of Object.keys(v)) out[k] = walk(v[k]);
     return out;
   }
-
   return walk(payload);
 }
-
 async function cloneBodyPreview(reqOrResp) {
-  // Try to parse JSON and return an OBJECT (not a string)
   try {
     const ct = reqOrResp.headers?.get?.("content-type") || "";
     if (/json/i.test(ct)) {
@@ -217,8 +287,6 @@ async function cloneBodyPreview(reqOrResp) {
       return data;
     }
   } catch {}
-
-  // Fallback to plain text for non-JSON or parse errors
   try {
     const text = await reqOrResp.clone().text();
     return maskPII(text).slice(0, MAX_LOG_BODY);
@@ -226,7 +294,6 @@ async function cloneBodyPreview(reqOrResp) {
     return "";
   }
 }
-
 function shortId() { return Math.random().toString(36).slice(2, 8); }
 function pretty(obj) { try { return JSON.stringify(obj, null, 2); } catch { return String(obj); } }
 function compact(obj) { try { return JSON.stringify(obj); } catch { return String(obj); } }
@@ -264,7 +331,7 @@ function withLogging(handler) {
       reqBody: reqPreview,
       status: res.status,
       resHeaders: headerObj(res.headers || new Headers()),
-      resBody: resPreview,   // <— now an OBJECT, summarized
+      resBody: resPreview,
       ms
     };
 
@@ -307,19 +374,16 @@ async function callWinTeamJSON(url, env) {
     const r = await fetch(url, { headers: buildWTHeaders(TENANT_ID, API_KEY) });
 
     const ct = (r.headers.get("content-type") || "").toLowerCase();
-    const raw = await r.text(); // read once
+    const raw = await r.text();
 
-    // Non-2xx → bubble up body (HTML/text) for debugging
     if (!r.ok) {
       return { ok:false, status:r.status, error: (raw || "").slice(0, 1000) || `HTTP ${r.status}` };
     }
 
-    // 204 or empty → treat as empty page, not a JSON parse error
     if (!raw || r.status === 204) {
       return { ok:true, data: { data: [] } };
     }
 
-    // Try JSON parse; if it fails, surface a helpful error
     try {
       const data = JSON.parse(raw);
       return { ok:true, data };
@@ -388,14 +452,8 @@ function stateFromSupervisor(supervisorDescription = "") {
 }
 
 // Expanded department mapping
-// Expanded department mapping
 function deriveDepartmentFromReason(reasonRaw = "") {
   const r = String(reasonRaw || "").trim();
-
-  // // HR (resignation / quit)
-  // if (/\b(quit|resign|resignation|two[-\s]?weeks|notice|separation|terminate|termination)\b/i.test(r)) {
-  //   return "HR";
-  // }
 
   // Payroll
   if (/\b(payroll|pay\s*(issue|check|stub)|w-?2|withhold|tax)\b/i.test(r)) return "Payroll";
@@ -410,44 +468,34 @@ function deriveDepartmentFromReason(reasonRaw = "") {
     "\\b(time\\s*card|timecard|punch|missed\\s*punch|schedule|swap|shift\\s*change)\\b",
     "\\b(transport|car\\s*(trouble|issue|problem|broke)|bus\\s*delay|uber|lyft|ride\\s*share|flat\\s*tire|traffic)\\b",
     "\\b(personal\\s*(issue|matter)|family\\s*(issue|emergency|matter)|child|kids?|doctor|dr\\.?|appointment|emergency)\\b",
-    "\\b(quit|resign|resignation|two[-\s]?weeks|notice|separation|terminate|termination)\\b"
+    "\\b(quit|resign|resignation|two[-\\s]?weeks|notice|separation|terminate|termination)\\b"
   ].join("|"), "i");
   if (opsRe.test(r)) return "Operations";
 
   return "Other";
 }
 
-// --- Supervisor/Dept → Division & Dept Email helpers ---
-
-// Use in your pipeline like:
-//   const division = deriveDivisionFromSupervisor(supervisorDescription, department);
-//   const deptEmail = deriveDepartmentEmail(supervisorDescription, department);
-
+// Supervisor/Dept → Division & Dept Email helpers
 function deriveDepartmentEmail(supervisorDescription = "", department = "") {
   const sup = String(supervisorDescription || "").trim();
   const dep = String(department || "").trim();
 
-  // 1) Explicit department wins
   if (/^training$/i.test(dep))  return "training@secureone.com";
   if (/^payroll$/i.test(dep))   return "payroll@secureone.com";
   if (/^hr$/i.test(dep))        return "hr@secureone.com";
   if (/^corporate$/i.test(dep)) return "corporate@secureone.com";
 
-  // 2) Corporate supervisors
   if (/\b(Chris\s+Jackson|Vince\s+Joyce|Jim\s+McGovern)\b/i.test(sup)) {
     return "corporate@secureone.com";
   }
 
-  // 3) Ops state teams → {st}opsteam@secureone.com (e.g., ilopsteam@)
   const OPS_STATES = new Set(["AL","AZ","TX","TN","OH","IN","IL"]);
-  // Match forms like "AZ OPS TEAM", "IL Operations", "... IL - Ops ..."
   const m = sup.match(/\b(AL|AZ|TX|TN|OH|IN|IL)\b.*\b(Ops|Operations)\b/i);
   if (m) {
     const st = m[1].toUpperCase();
     if (OPS_STATES.has(st)) return `${st.toLowerCase()}opsteam@secureone.com`;
   }
 
-  // 4) Default: unknown
   return "";
 }
 
@@ -455,15 +503,12 @@ function deriveDivisionFromSupervisor(supervisorDescription = "", department = "
   const sup = String(supervisorDescription || "").trim();
   const dep = String(department || "").trim();
 
-  // 1) Explicit department "Corporate" wins
   if (/^corporate$/i.test(dep)) return "Corporate";
 
-  // 2) Corporate supervisors
   if (/\b(Chris\s+Jackson|Vince\s+Joyce|Jim\s+McGovern)\b/i.test(sup)) {
     return "Corporate";
   }
 
-  // 3) Ops state teams → Full state name + " Division"
   const STATE_NAME = {
     AL: "Alabama",
     AZ: "Arizona",
@@ -479,10 +524,8 @@ function deriveDivisionFromSupervisor(supervisorDescription = "", department = "
     if (STATE_NAME[st]) return `${STATE_NAME[st]} Division`;
   }
 
-  // 4) No inference
   return "";
 }
-
 
 ///////////////////////////////
 // Builders
@@ -493,7 +536,6 @@ function mondayStatusLabel(label) {
 }
 
 function buildMondayColumnsFromFriendly(body) {
-  // Accept aliases for time in/out
   if (body.ofctimeinorout && !body.timeInOut && !body.timeinorout) body.timeInOut = body.ofctimeinorout;
   if (body.timeinorout && !body.timeInOut) body.timeInOut = body.timeinorout;
 
@@ -505,7 +547,6 @@ function buildMondayColumnsFromFriendly(body) {
     }
   };
 
-  // text-ish
   addIf("site");
   addIf("reason");
   addIf("timeInOut");
@@ -515,26 +556,22 @@ function buildMondayColumnsFromFriendly(body) {
   addIf("zoomGuid");
   addIf("shift");
 
-  // Alias: ofcWorksite -> site column if 'site' wasn’t explicitly set
   if (!out[MONDAY_COLUMN_MAP.site] && body.ofcWorksite) {
     out[MONDAY_COLUMN_MAP.site] = String(body.ofcWorksite).trim();
   }
 
   if (body.itemIdEcho) out[MONDAY_COLUMN_MAP.itemIdEcho] = body.itemIdEcho;
 
-  // email
   addIf("email", (v) => {
     const email = String(v).trim();
     if (!email || !/@/.test(email)) return undefined;
     return { email, text: email };
   });
 
-  // phones
   const normPhone = (raw) => String(raw).replace(/[^\d+]/g, "").trim();
   addIf("phone",   (v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
   addIf("callerId",(v) => { const p = normPhone(v); return p ? { phone: p, countryShortName: "US" } : undefined; });
 
-  // date/time
   if (body.dateTime) {
     const v = body.dateTime;
     if (typeof v === "object" && (v.date || v.time)) {
@@ -551,7 +588,6 @@ function buildMondayColumnsFromFriendly(body) {
     }
   }
 
-  // ----- Division from explicit or derived state (prefer ofcWorkstate first) -----
   const explicitDivision = String(body.division || "").trim();
 
   let derivedDivision = "";
@@ -583,13 +619,11 @@ function buildMondayColumnsFromFriendly(body) {
   const finalDivision = explicitDivision || derivedDivision;
   if (finalDivision) out[MONDAY_COLUMN_MAP.division] = mondayStatusLabel(finalDivision);
 
-  // ----- Department (existing behavior) -----
   const explicitDept = String(body.department || "").trim();
   const deptRaw = explicitDept || deriveDepartmentFromReason(body.callreason || body.reason || "");
   const dept = normalizeDepartmentLabel(deptRaw);
   if (dept) out[MONDAY_COLUMN_MAP.department] = mondayStatusLabel(dept);
 
-  // cleanup
   for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
   return out;
 }
@@ -614,14 +648,12 @@ async function fetchEmployeeDetail(employeeNumber, env) {
   };
 }
 
-// Chunked (≤30d) cellId lookup; single-day when from/to provided
-// Direct lookup within a provided window (kept < 30d). No chunking.
+// Direct lookup within a provided window (<30d cap)
 async function fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate, toDate }) {
   const want = String(cellId ?? "").trim();
   if (!employeeNumber || !want) return null;
   if (!fromDate || !toDate) return null;
 
-  // clamp to 29 days max just in case
   const fromD = new Date(fromDate + "T00:00:00Z");
   const toD   = new Date(toDate   + "T00:00:00Z");
   const maxTo = new Date(fromD.getTime() + 29*24*60*60*1000);
@@ -651,7 +683,7 @@ async function fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate,
         const startLocal = parseNaiveAsLocalWall(s.startTime);
         let   endLocal   = parseNaiveAsLocalWall(s.endTime);
         if (startLocal && endLocal && endLocal.getTime() <= startLocal.getTime()) {
-          endLocal = new Date(endLocal.getTime() + 24*60*60*1000); // overnight
+          endLocal = new Date(endLocal.getTime() + 24*60*60*1000);
         }
         return {
           cellId: have,
@@ -666,7 +698,7 @@ async function fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate,
   return null;
 }
 
-// Fallback via our own /winteam/shifts (15d window) filtered by cellId
+// Fallback via our own /winteam/shifts filtered by cellId
 async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint }) {
   const origin = new URL(req.url).origin;
   const want = String(cellId || "").trim();
@@ -706,8 +738,8 @@ async function fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dat
     cellId: String(hit.cellId).trim(),
     site: String(hit.site || hit.siteName || "").trim(),
     siteName: String(hit.site || hit.siteName || "").trim(),
-    startLocalISO: String(hit.startLocalISO || hit.startIso || "").trim(),
-    endLocalISO:   String(hit.endLocalISO   || hit.endIso   || "").trim()
+    startLocalISO: String(hit.startLocalISO || "").trim(),
+    endLocalISO:   String(hit.endLocalISO   || "").trim()
   };
 }
 
@@ -766,19 +798,15 @@ async function handleShifts(req, env) {
 
   if (!employeeNumber) return json({ success:false, message:"employeeNumber is required." }, { status:400 });
 
-  // ---- Choose window for WinTeam request (honor dateFrom/dateTo if provided) ----
   const startBase = nowAnchor();
-
   function validYmd(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s || "")); }
 
-  // Default: today ± 10 days (21-day window), always clamp to <30 days when custom range is provided.
-  // ---- Choose window (honor dateFrom/dateTo if valid; else default ±10d) ----
   let winFrom, winTo;
   if (validYmd(reqDateFrom) && validYmd(reqDateTo)) {
     const fromD = new Date(reqDateFrom + "T00:00:00Z");
     const toD   = new Date(reqDateTo   + "T00:00:00Z");
     if (!isNaN(fromD) && !isNaN(toD)) {
-      const maxTo = new Date(fromD.getTime() + 29*24*60*60*1000); // <30d cap
+      const maxTo = new Date(fromD.getTime() + 29*24*60*60*1000);
       const toClamped = (toD > maxTo ? maxTo : toD);
       winFrom = ymd(fromD);
       winTo   = ymd(toClamped);
@@ -834,7 +862,6 @@ async function handleShifts(req, env) {
     }
   }
 
-  // Sort & page (3)
   rows.sort((a,b) => Date.parse(a.startLocalISO) - Date.parse(b.startLocalISO));
   const countTotal = rows.length;
   const p = Math.max(0, pageStart|0);
@@ -874,14 +901,12 @@ async function handleMondayWrite(req, env) {
   const ofcPhone       = normalizeUsPhone(trim(body.ofcPhone || body.phone || ""));
   const ofcEmail       = trim(body.ofcEmail || body.email || "");
   const callerId       = normalizeUsPhone(trim(body.callerId || body.ANI || body.ani || ofcPhone || ""));
-  const groupId        = trim(body.groupId || ""); // optional; same group used regardless
+  const groupId        = trim(body.groupId || "");
 
-  // manual details & location
   const ofcFullname  = trim(body.ofcFullname || body.fullname || body.fullName || "");
   const ofcWorkstate = trim(body.ofcWorkstate || body.workState || body.state || "");
   const ofcWorksite  = trim(body.ofcWorksite  || body.site || "");
 
-  // Manual validation
   if (mode === "manual") {
     const errs = [];
     if (!ofcFullname) errs.push("ofcFullname");
@@ -890,21 +915,19 @@ async function handleMondayWrite(req, env) {
     if (errs.length) return json({ success:false, message:"Missing required fields (manual mode).", missing: errs }, { status:400 });
   }
 
-  // Item name policy (same board/group for both)
   let itemName = trim(body.itemName || body.name || "");
   if (!itemName) {
     if (mode === "manual") {
-      itemName = `${ofcFullname || "Unknown"} (NO AUTH)`; // NO AUTH naming
+      itemName = `${ofcFullname || "Unknown"} (NO AUTH)`;
     } else {
       itemName = `${employeeNumber || ofcFullname || "Unknown"} | Auto`;
     }
   }
 
-  // Friendly → columns (no extra/manual-only columns)
   const cvFriendly = {
-    ofcWorkstate,                // → Division via builder
-    ofcWorksite,                 // → Account/Site via alias
-    site: body.site,             // explicit site still honored
+    ofcWorkstate,
+    ofcWorksite,
+    site: body.site,
     reason: callreason,
     timeInOut: body.timeInOut || body.ofctimeinorout,
     startTime: body.startTime,
@@ -922,7 +945,6 @@ async function handleMondayWrite(req, env) {
   };
   const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
 
-  // Dedupe key
   let dedupeKey = trim(body.dedupeKey || "");
   if (!dedupeKey) {
     if (engagementId && employeeNumber) dedupeKey = `${engagementId}:${employeeNumber}`;
@@ -934,7 +956,6 @@ async function handleMondayWrite(req, env) {
     return json({ success:true, message:"Duplicate suppressed by flow guard.", mode, dedupeKey, upserted:false, item:null, columnValues });
   }
 
-  // Optional UPSERT by Zoom GUID if present
   let targetItemId = null;
   if (engagementId && MONDAY_COLUMN_MAP.zoomGuid) {
     try {
@@ -961,7 +982,6 @@ async function handleMondayWrite(req, env) {
     return json({ success:true, message:"Monday item updated (UPSERT).", mode, boardId, item: { id: targetItemId }, dedupeKey, engagementId, columnValuesSent: columnValues });
   }
 
-  // CREATE (same group either way)
   const createMutation = `
     mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
       create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
@@ -993,7 +1013,7 @@ async function handleMondayWrite(req, env) {
   return json({ success:true, message:"Monday item created/updated.", mode, boardId, item: created, dedupeKey: dedupeKey || null, engagementId: engagementId || null, columnValuesSent: columnValues });
 }
 
-// Legacy write (by selection index) — unchanged logic aside from ANI alias & timeInOut alias handled in builder
+// Legacy write (by selection index)
 async function handleZvaShiftWrite(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -1056,8 +1076,7 @@ async function handleZvaShiftWrite(req, env) {
   return json({ success: !!mData?.success, message: mData?.message || "Done.", sent: { itemName, dedupeKey, site, startISO, endISO, callerId, reason, engagementId }, monday: mData }, { status: mData?.success ? 200 : 500 });
 }
 
-// Preferred: write by cellId (with dateHint day window + chunked fallbacks)
-// Preferred: write by cellId (with dateHint day window + chunked fallbacks)
+// Preferred: write by cellId
 async function handleZvaShiftWriteByCell(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -1075,13 +1094,9 @@ async function handleZvaShiftWriteByCell(req, env) {
     return json({ success:false, message:"employeeNumber required" }, { status:400 });
   }
 
-  // Only allow a no-cellId write to quit flow if:
-  //  - reason looks like resignation, OR
-  //  - caller explicitly set allow_no_cell=true.
   const explicitAllowNoCell = String(body.allow_no_cell || "").toLowerCase() === "true";
   const allowQuitNoCell = isResignationish(reason) || explicitAllowNoCell;
 
-  // If no cellId but looks like resignation, delegate to quit writer
   if (!cellId && allowQuitNoCell) {
     const quitBody = {
       employeeNumber,
@@ -1090,8 +1105,8 @@ async function handleZvaShiftWriteByCell(req, env) {
       email: String(body.email || body.ofcEmail || ""),
       callreason: reason || "Resignation",
       notes: String(body.notes || body.note || body.details || ""),
-      dateHint,                           // “last day” hint if provided
-      groupId: String(body.groupId || "") // optional Monday group override
+      dateHint,
+      groupId: String(body.groupId || "")
     };
     const fakeReq = new Request(new URL("/zva/quit-write", req.url).toString(), {
       method: "POST",
@@ -1101,11 +1116,10 @@ async function handleZvaShiftWriteByCell(req, env) {
     return await handleZvaQuitWrite(fakeReq, env);
   }
 
-  // From here on, cellId is REQUIRED for shift-based writes.
   if (!cellId) {
     return json({
       success:false,
-      message:"cellId required for shift-based calls. (Tip: use your tool’s manual intake path for callers without a shift selection, or pass allow_no_cell=true only when it is truly a resignation.)"
+      message:"cellId required for shift-based calls. (Use manual intake when no shift selection is available.)"
     }, { status:400 });
   }
 
@@ -1121,33 +1135,24 @@ async function handleZvaShiftWriteByCell(req, env) {
   };
   const callerId = normPhone(aniRaw);
 
-  // Try to get employee (for division/department/email)
   let employee = null;
   try { employee = await fetchEmployeeDetail(employeeNumber, env); }
   catch (e) { console.log("ZVA DEBUG writer: fetchEmployeeDetail threw", String(e?.message || e)); }
   const fullName = (employee?.fullName || employee?.name || "").toString().trim();
 
-  // ---- Find the shift by cellId ----
   let shift = null;
-
-  // Resolve anchor date (dateHint if present, else today)
   const anchorYmd = dateHint ? ymdFromISODate(dateHint) : ymd(new Date());
 
   if (anchorYmd) {
-    // 1) Exact day first
     const exact = windowExactDay(anchorYmd);
     console.log("ZVA DEBUG writer: date window exact", exact);
     shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: exact.from, toDate: exact.to });
   }
-
-  // 2) If not found, try ±14 days around anchor (29-day window, <30 cap)
   if (!shift && anchorYmd) {
     const around = windowAround(anchorYmd, 14, 14);
     console.log("ZVA DEBUG writer: date window around", around);
     shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId, fromDate: around.from, toDate: around.to });
   }
-
-  // 3) Last resort: via our own endpoint, still anchored near the same date
   if (!shift) {
     try {
       shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId, dateHint: anchorYmd });
@@ -1162,11 +1167,10 @@ async function handleZvaShiftWriteByCell(req, env) {
   }
 
   const site     = (shift.site || shift.siteName || "").toString().trim();
-  const startISO = (shift.startLocalISO || shift.startIso || "").toString().trim();
-  const endISO   = (shift.endLocalISO   || shift.endIso   || "").toString().trim();
+  const startISO = (shift.startLocalISO || "").toString().trim();
+  const endISO   = (shift.endLocalISO   || "").toString().trim();
   console.log("ZVA DEBUG writer: matched cellId", { employeeNumber, cellId, site, start: startISO, end: endISO });
 
-  // ---- Monday write ----
   const itemName  = `${employeeNumber || "unknown"} | ${fullName || "Unknown Caller"}`;
   const dateKey   = startISO ? startISO.slice(0,10) : "date?";
   const dedupeKey = engagementId || [employeeNumber || "emp?", site || "site?", dateKey].join("|");
@@ -1253,10 +1257,22 @@ async function handleZvaShiftWriteByCell(req, env) {
   }, { status: 200 });
 }
 
+// --- SSN verification for resignations ---
+async function verifyEmployeeSSN(env, { employeeNumber, ssnLast4 }) {
+  if (!employeeNumber || !ssnLast4 || String(ssnLast4).trim().length !== 4) return { ok:false, match:false };
+  const wt = await callWinTeamJSON(buildEmployeeURL(employeeNumber), env);
+  if (!wt.ok) return { ok:false, match:false, error: wt.error, status: wt.status };
+  const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
+  const results = Array.isArray(page?.results) ? page.results : [];
+  const match = results[0];
+  if (!match) return { ok:false, match:false };
+  return { ok:true, match: String(match.partialSSN || "").trim() === String(ssnLast4).trim(), raw: match };
+}
+
 // --- /zva/absence-write ---
-// Creates a non-resignation "Call Off / Absence" item in Monday
+// Auto path: prefers selectedCellId/cellId; else resolves from friendly date → earliest shift.
+// Manual path only if neither is available.
 async function handleZvaAbsenceWrite(req, env) {
-  // Read + normalize
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
   if (body?.data && typeof body.data === "object") body = body.data;
@@ -1269,43 +1285,21 @@ async function handleZvaAbsenceWrite(req, env) {
   const callreason     = S(body.callreason || body.reason || "Call off / absence");
   const notes          = S(body.notes || body.note || body.details || "");
   const dateHintRaw    = S(body.dateHint || body.fromDate || body.date || "");
+  const selCellId      = S(body.selectedCellId || body.cellId || "");
 
-  // Optional free-text hints when no shift was matched
-  const siteHint       = S(body.siteHint || body.site || body.location || "");
-  const startTime      = S(body.startTime || "");
-  const endTime        = S(body.endTime || "");
-  const hours          = S(body.hours || "");
-
-  const groupId        = S(body.groupId || ""); // let caller override group if desired
+  const groupId        = S(body.groupId || "");
   const boardId        = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) return json({ success:false, message:"boardId missing (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID in env)." }, { status:400 });
 
-  // Minimal identity: employeeNumber OR (name + ANI)
   if (!employeeNumber && !(ofcFullname && aniRaw)) {
     return json({ success:false, message:"Provide employeeNumber OR (ofcFullname + callerId)." }, { status:400 });
   }
 
-  // Normalize basics
   const callerId = normalizeUsPhone(aniRaw);
-  const email    = (function (raw) {
-    const e = String(raw || "").trim();
-    return e && /@/.test(e) ? e : "";
-  })(emailRaw);
+  const email    = (function (raw) { const e = String(raw || "").trim(); return e && /@/.test(e) ? e : ""; })(emailRaw);
 
-  // Normalize dateHint -> YYYY-MM-DD (today/tomorrow supported)
-  const dateHint = (function toYmd(v) {
-    const s = S(v);
-    if (!s) return "";
-    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
-    const kw = s.toLowerCase();
-    const base = new Date();
-    if (kw === "today")    return ymd(base);
-    if (kw === "tomorrow") return ymd(addDaysUTC(base, 1));
-    const d = new Date(s);
-    return isNaN(d) ? "" : ymd(d);
-  })(dateHintRaw);
+  const friendlyYmd = dateHintRaw ? parseFriendlyDate(dateHintRaw) : "";
 
-  // Enrich via WinTeam if we have an employee number
   let employee = null;
   if (employeeNumber) {
     try { employee = await fetchEmployeeDetail(employeeNumber, env); } catch {}
@@ -1314,50 +1308,84 @@ async function handleZvaAbsenceWrite(req, env) {
   const division  = stateFromSupervisor(employee?.supervisorDescription || "") 
                  || STATE_FULL[(employee?.workstate || "").toUpperCase()] 
                  || S(employee?.workstate);
-  // Classify as Operations (not HR)
   const department = "Operations";
   const deptEmail  = deriveDepartmentEmail(employee?.supervisorDescription || "", department);
 
-  // Build item name
-  const who = employeeNumber ? `${employeeNumber} | ${fullName}` : fullName || callerId || "Unknown";
-  const itemName = `${who} (Call Off)${dateHint ? ` — ${dateHint}` : ""}`;
+  let site = S(body.siteHint || body.site || body.location || "");
+  let startISO = "", endISO = "", autoNote = "";
 
-  // Friendly → Monday column values
+  if (selCellId) {
+    try {
+      const anchor = friendlyYmd || ymd(new Date());
+      let shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId: selCellId, fromDate: anchor, toDate: ymdAdd(anchor, 1) });
+      if (!shift) {
+        const around = windowAround(anchor, 14, 14);
+        shift = await fetchShiftByCellIdDirect(env, { employeeNumber, cellId: selCellId, fromDate: around.from, toDate: around.to });
+      }
+      if (!shift) {
+        shift = await fetchShiftByCellIdViaSelf(req, env, { employeeNumber, cellId: selCellId, dateHint: anchor });
+      }
+      if (shift) {
+        site = site || S(shift.site || shift.siteName || "");
+        startISO = S(shift.startLocalISO || "");
+        endISO   = S(shift.endLocalISO   || "");
+        autoNote = "Auto — shift matched by cellId";
+      }
+    } catch {}
+  }
+
+  if (!startISO && !endISO && !selCellId && friendlyYmd) {
+    const hit = await fetchShiftByDateViaSelf(req, env, { employeeNumber, ymdDate: friendlyYmd }).catch(() => null);
+    if (hit) {
+      site = site || S(hit.site || "");
+      startISO = S(hit.startLocalISO || "");
+      endISO   = S(hit.endLocalISO   || "");
+      autoNote = "Auto — earliest shift on requested date";
+    }
+  }
+
+  const startNice = startISO ? fmtYmdHmUTC(startISO) : S(body.startTime || "");
+  const endNice   = endISO   ? fmtYmdHmUTC(endISO)   : S(body.endTime   || "");
+  const hours     = S(body.hours || "");
+
+  const who = employeeNumber ? `${employeeNumber} | ${fullName}` : fullName || callerId || "Unknown";
+  const itemName = `${who} (Call Off)${friendlyYmd ? ` — ${friendlyYmd}` : ""}`;
+
   const nowISO = new Date().toISOString();
   const cvFriendly = {
-    division,                // Status
-    department,              // Status
-    deptEmail,               // text
+    division,
+    department,
+    deptEmail,
     reason: [
       "Absence / Call Off",
       `Reason: ${callreason}`,
-      dateHint ? `Date: ${dateHint}` : null,
-      siteHint ? `Site: ${siteHint}` : null,
-      (startTime || endTime) ? `Time: ${startTime || "?"} → ${endTime || "?"}` : null,
+      friendlyYmd ? `Date: ${friendlyYmd}` : null,
+      site ? `Site: ${site}` : null,
+      (startNice || endNice) ? `Time: ${startNice || "?"} → ${endNice || "?"}` : null,
       hours ? `Hours: ${hours}` : null,
       notes ? `Notes: ${notes}` : null
     ].filter(Boolean).join("\n"),
-    site: siteHint,          // also surface in the Site column if provided
-    startTime,
-    endTime,
-    zoomGuid: "",            // none for manual absence
+    site,
+    startTime: startNice,
+    endTime: endNice,
+    zoomGuid: "",
     email,
     phone: employee?.phone1 || "",
     callerId,
-    dateTime: nowISO,        // audit stamp
-    shift: "Manual Intake – no shift provided"
+    dateTime: nowISO,
+    shift: (startNice || endNice || selCellId)
+      ? (autoNote || "Auto — inferred shift")
+      : "Manual Intake – no shift provided"
   };
   const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
   const cvString = JSON.stringify(columnValues);
 
-  // Dedupe to avoid repeats (by emp/name + date + reason)
   const deKeyWho = (employeeNumber || fullName || callerId || "unknown").toLowerCase();
-  const dedupeKey = `absence|${deKeyWho}|${dateHint || "nodate"}|${callreason.toLowerCase().slice(0,24)}`;
+  const dedupeKey = `absence|${deKeyWho}|${(friendlyYmd || "nodate")}|${callreason.toLowerCase().slice(0,24)}`;
   if (await flowGuardSeen(env, dedupeKey)) {
     return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false });
   }
 
-  // Create Monday item (same pattern as other handlers)
   const createMutation = `
     mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
       create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
@@ -1386,13 +1414,12 @@ async function handleZvaAbsenceWrite(req, env) {
 
   await flowGuardMark(env, dedupeKey);
 
-  // Friendly log
   try {
     console.log(`✅ ZVA ABSENCE SUMMARY: ${JSON.stringify({
       employeeNumber: employeeNumber || null,
       fullname: fullName,
-      date: dateHint || null,
-      siteHint: siteHint || null,
+      date: friendlyYmd || null,
+      siteHint: site || null,
       mondayItemId: created?.id || null,
       dedupeKey
     }, null, 2)}`);
@@ -1407,9 +1434,7 @@ async function handleZvaAbsenceWrite(req, env) {
   }, { status: 200 });
 }
 
-
-
-// Resignation writer: no shift, no engagementId required
+// Resignation writer: prefers employeeNumber + ssnLast4; friendly last day.
 async function handleZvaQuitWrite(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -1423,75 +1448,78 @@ async function handleZvaQuitWrite(req, env) {
   const reasonRaw      = s(body.callreason || body.reason || "Resignation");
   const notesExtra     = s(body.notes || body.note || body.details || "");
   const lastDayHint    = s(body.quitLastDay || body.lastDay || body.dateHint || "");
-  const groupId        = s(body.groupId || ""); // optional Monday group override
+  const ssnLast4       = s(body.ssnLast4 || "");
 
-  // minimal inputs: employeeNumber OR (fullname + ANI)
+  const groupId        = s(body.groupId || "");
+
   if (!employeeNumber && !(ofcFullname && aniRaw)) {
     return json({ success:false, message:"Provide employeeNumber OR (ofcFullname + callerId)." }, { status:400 });
   }
 
-  // Normalize basics
   const callerId = normalizeUsPhone(aniRaw);
-  const email    = (function (raw) {
-    const e = String(raw || "").trim();
-    return e && /@/.test(e) ? e : "";
-  })(emailRaw);
+  const email    = (function (raw) { const e = String(raw || "").trim(); return e && /@/.test(e) ? e : ""; })(emailRaw);
 
-  // Determine last day (default: today)
-  const lastDayISO = (function() {
-    if (!lastDayHint) return ymd(new Date());
-    const d = new Date(lastDayHint);
-    return isNaN(d.getTime()) ? ymd(new Date()) : ymd(d);
-  })();
-
-  // Enrich from WinTeam if we have an employeeNumber
-  let employee = null;
-  if (employeeNumber) {
+  let verified = false, employee = null;
+  if (employeeNumber && ssnLast4.length === 4) {
+    try {
+      const v = await verifyEmployeeSSN(env, { employeeNumber, ssnLast4 });
+      verified = !!v.match;
+      if (v.ok && v.raw) {
+        employee = {
+          fullName: [s(v.raw.firstName), s(v.raw.lastName)].filter(Boolean).join(" "),
+          workstate: s(v.raw.state || v.raw.workState || ""),
+          supervisorDescription: s(v.raw.supervisorDescription || ""),
+          emailAddress: s(v.raw.emailAddress || ""),
+          phone1: normalizeUsPhone(v.raw.phone1 || "")
+        };
+      }
+    } catch {}
+  }
+  if (!employee && employeeNumber) {
     try { employee = await fetchEmployeeDetail(employeeNumber, env); } catch {}
   }
+
   const fullName = s(ofcFullname || employee?.fullName || "Unknown Caller");
-  
-  // Department + routing
-  const department = "Operations"; 
+
+  const friendlyLastDay = lastDayHint ? parseFriendlyDate(lastDayHint) : "";
+  const lastDayISO = friendlyLastDay || ymd(new Date());
+
+  const department = "Operations"; // set to "HR" if you prefer
   const deptEmail  = deriveDepartmentEmail(employee?.supervisorDescription || "", department);
   const division   = stateFromSupervisor(employee?.supervisorDescription || "") 
                   || STATE_FULL[(employee?.workstate || "").toUpperCase()] 
                   || s(employee?.workstate);
 
-  // Build item
-  const itemName = `${employeeNumber || "UNKNOWN"} | ${fullName} (Resignation)`;
+  const itemName = `${employeeNumber || "UNKNOWN"} | ${fullName} (Resignation${verified ? " — Verified" : ""})`;
 
-  // Monday board (required)
   const boardId = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) return json({ success:false, message:"boardId missing (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID in env)." }, { status:400 });
 
-  // Idempotency key (uses KV FLOW_GUARD if bound)
   const dedupeKey = `quit|${employeeNumber || callerId || "unknown"}|${lastDayISO}`;
   if (await flowGuardSeen(env, dedupeKey)) {
     return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false });
   }
 
-  // Column payload (reuse your builder keys)
   const nowISO = new Date().toISOString();
   const cvFriendly = {
-    division,               // will map to Status via builder
-    department,             // -> Status
-    deptEmail,              // -> text
+    division,
+    department,
+    deptEmail,
     reason: [
       "Resignation",
       reasonRaw && `Reason: ${reasonRaw}`,
       `Last day: ${lastDayISO}`,
+      verified ? "Identity: Verified by SSN last4" : "Identity: Not verified",
       notesExtra && `Notes: ${notesExtra}`
     ].filter(Boolean).join("\n"),
-    dateTime: nowISO,       // timestamp of intake
+    dateTime: nowISO,
     email: email || employee?.emailAddress || "",
     phone: employee?.phone1 || "",
-    callerId                // show ANI in its own column
+    callerId
   };
   const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
   const cvString = JSON.stringify(columnValues);
 
-  // Create item
   const createMutation = `
     mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
       create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
@@ -1506,7 +1534,6 @@ async function handleZvaQuitWrite(req, env) {
     return json({ success:false, message:"Monday create_item failed.", detail:String(e) }, { status:502 });
   }
 
-  // Set columns
   if (Object.keys(columnValues).length) {
     const changeMutation = `
       mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
@@ -1519,14 +1546,13 @@ async function handleZvaQuitWrite(req, env) {
     }
   }
 
-  // Mark idempotent
   await flowGuardMark(env, dedupeKey);
 
-  // Friendly summary log
   console.log(`✅ ZVA QUIT SUMMARY: ${pretty({
     employeeNumber: employeeNumber || null,
     fullname: fullName,
     lastDay: lastDayISO,
+    verified,
     deptEmail,
     mondayItemId: created?.id || null,
     dedupeKey
