@@ -1269,39 +1269,93 @@ async function verifyEmployeeSSN(env, { employeeNumber, ssnLast4 }) {
   return { ok:true, match: String(match.partialSSN || "").trim() === String(ssnLast4).trim(), raw: match };
 }
 
-// --- helper: get earliest shift on a specific YMD via self /winteam/shifts
+// --- helper: get earliest shift on a specific YMD
 async function fetchEarliestShiftOnDateViaSelf(req, env, { employeeNumber, ymdDay }) {
   if (!employeeNumber || !ymdDay) return null;
 
-  const origin = new URL(req.url).origin;
-  const body = { employeeNumber, dateFrom: ymdDay, dateTo: ymdAdd(ymdDay, 1), pageStart: 0 };
-
-  let j;
+  // 1) Try via our own /winteam/shifts
   try {
+    const origin = new URL(req.url).origin;
+    const body = { employeeNumber, dateFrom: ymdDay, dateTo: ymdAdd(ymdDay, 1), pageStart: 0 };
     const r = await fetch(`${origin}/winteam/shifts`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body)
     });
-    const text = await r.text();
-    j = JSON.parse(text);
+
+    if (r.ok) {
+      // prefer JSON but tolerate non-JSON
+      let j = null;
+      const ct = (r.headers.get("content-type") || "").toLowerCase();
+      if (ct.includes("json")) {
+        j = await r.json();
+      } else {
+        try { j = JSON.parse(await r.text()); } catch (_) { j = null; }
+      }
+      if (j) {
+        const arr = Array.isArray(j?.entries) && j.entries.length
+          ? j.entries
+          : (Array.isArray(j?.entries_page) ? j.entries_page : []);
+        if (arr.length) {
+          const first = arr[0];
+          return {
+            cellId: String(first.cellId || "").trim(),
+            site: String(first.site || first.siteName || "").trim(),
+            siteName: String(first.site || first.siteName || "").trim(),
+            startLocalISO: String(first.startLocalISO || first.startIso || "").trim(),
+            endLocalISO:   String(first.endLocalISO   || first.endIso   || "").trim()
+          };
+        }
+      }
+    } else {
+      console.log("ZVA DEBUG earliestOnDate: /winteam/shifts non-OK", r.status);
+    }
   } catch (e) {
-    console.log("ZVA DEBUG earliestOnDate: fetch to /winteam/shifts threw", String(e?.message || e));
-    return null;
+    console.log("ZVA DEBUG earliestOnDate: /winteam/shifts threw", String(e?.message || e));
   }
 
-  const arr = Array.isArray(j?.entries) ? j.entries : (Array.isArray(j?.entries_page) ? j.entries_page : []);
-  if (!arr.length) return null;
+  // 2) Fallback: call WinTeam shiftDetails directly and pick the earliest
+  try {
+    const fromDate = ymdDay, toDate = ymdAdd(ymdDay, 1);
+    const url = new URL(SHIFTS_BASE_EXACT);
+    url.searchParams.set("employeeNumber", String(employeeNumber));
+    url.searchParams.set("fromDate", fromDate);
+    url.searchParams.set("toDate", toDate);
 
-  // entries are already sorted by start time in /winteam/shifts
-  const first = arr[0];
-  return {
-    cellId: String(first.cellId || "").trim(),
-    site: String(first.site || first.siteName || "").trim(),
-    siteName: String(first.site || first.siteName || "").trim(),
-    startLocalISO: String(first.startLocalISO || first.startIso || "").trim(),
-    endLocalISO:   String(first.endLocalISO   || first.endIso   || "").trim()
-  };
+    const wt = await callWinTeamJSON(url.toString(), env);
+    if (!wt.ok) {
+      console.log("ZVA DEBUG earliestOnDate fallback: WT failed", wt.status, (wt.error || "").slice(0, 160));
+      return null;
+    }
+
+    const page = Array.isArray(wt.data?.data) ? wt.data.data[0] : null;
+    const results = Array.isArray(page?.results) ? page.results : [];
+    // Flatten to (shift, site), then pick earliest start
+    const all = [];
+    for (const r of results) {
+      const siteName = (r.jobDescription || "").toString().trim();
+      const shifts = Array.isArray(r.shifts) ? r.shifts : [];
+      for (const s of shifts) {
+        const startLocal = parseNaiveAsLocalWall(s.startTime);
+        let   endLocal   = parseNaiveAsLocalWall(s.endTime);
+        if (!startLocal || !endLocal) continue;
+        if (endLocal.getTime() <= startLocal.getTime()) endLocal = new Date(endLocal.getTime() + 24*60*60*1000);
+        all.push({
+          cellId: String(s.cellId ?? "").trim(),
+          site: siteName,
+          siteName,
+          startLocalISO: startLocal.toISOString(),
+          endLocalISO:   endLocal.toISOString()
+        });
+      }
+    }
+    if (!all.length) return null;
+    all.sort((a,b) => Date.parse(a.startLocalISO) - Date.parse(b.startLocalISO));
+    return all[0];
+  } catch (e) {
+    console.log("ZVA DEBUG earliestOnDate fallback WT threw", String(e?.message || e));
+    return null;
+  }
 }
 
 // --- /zva/absence-write (UPGRADED) ---
