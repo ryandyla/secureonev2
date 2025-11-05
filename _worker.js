@@ -1722,10 +1722,8 @@ async function handleZvaQuitWriteSimple(req, env) {
 
   const nowISO = new Date().toISOString();
   const reasonBlock = [
-    "Resignation (Simple)",
-    `Last day: ${lastDayISO}`,
-    reasonRaw && `Reason: ${reasonRaw}`,
-    notesExtra && `Notes: ${notesExtra}`
+    "Resignation",
+    `Last day: ${lastDayISO}`
   ].filter(Boolean).join("\n");
 
   const cvFriendly = {
