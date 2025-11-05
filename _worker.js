@@ -1447,6 +1447,7 @@ async function handleZvaAbsenceWrite(req, env) {
   const ofcFullname    = S(body.ofcFullname || body.fullname || body.fullName || "");
   const aniRaw         = S(body.ani || body.callerId || "");
   const emailRaw       = S(body.email || body.ofcEmail || "");
+  const email          = S(body.email || body.ofcEmail || "");
   const callreason     = S(body.callreason || body.reason || "Call off / absence");
   const notes          = S(body.notes || body.note || body.details || "");
   const dateHintRaw    = S(body.dateHint || body.fromDate || body.date || "");
@@ -1468,10 +1469,10 @@ async function handleZvaAbsenceWrite(req, env) {
   }
 
   const callerId = normalizeUsPhone(aniRaw);
-  const email    = (() => {
-    const e = String(emailRaw || "").trim();
-    return e && /@/.test(e) ? e : "";
-  })();
+  // const email    = (() => {
+  //   const e = String(emailRaw || "").trim();
+  //   return e && /@/.test(e) ? e : "";
+  // })();
 
   // Friendly date -> YYYY-MM-DD
   const dateHint = (() => {
@@ -1498,10 +1499,10 @@ async function handleZvaAbsenceWrite(req, env) {
   if (reasonClass === "absence")   absenceType = "Absence / Call Off";
   if (reasonClass === "late_in")   absenceType = "Late Arrival";
 
-  const reasonSlug = (reasonClass === "early_out") ? "leave_early"
-                   : (reasonClass === "absence")   ? "absence"
-                   : (reasonClass === "late_in")   ? "late_in"
-                   : "other";
+  // const reasonSlug = (reasonClass === "early_out") ? "leave_early"
+  //                  : (reasonClass === "absence")   ? "absence"
+  //                  : (reasonClass === "late_in")   ? "late_in"
+  //                  : "other";
 
   // Enrich via WinTeam
   let employee = null;
@@ -1561,7 +1562,10 @@ async function handleZvaAbsenceWrite(req, env) {
   // Derive Time In/Out value from inputs + phrase parsing
   const explicitTimeInOut = S(body.timeInOut || body.ofctimeinorout || body.timeinorout || "");
   const parsedPhrase      = extractTimeInOutPhrase(callreason) || extractTimeInOutPhrase(notes);
-  const timeInOutForCv    = explicitTimeInOut || parsedPhrase;
+
+  // Pass-through for Time In/Out phrases (e.g., "30 minutes late", "leave at 8:00 PM")
+  const timeInOutForCv = S(body.ofctimeinorout || body.timeinorout || "");
+  // const timeInOutForCv    = explicitTimeInOut || parsedPhrase; -- I think this was working but trying something new, will revert if not good
 
   const reasonBlock = [
     absenceType,
@@ -1574,6 +1578,14 @@ async function handleZvaAbsenceWrite(req, env) {
     notes ? `Notes: ${notes}` : null*/
   ].filter(Boolean).join("\n");
 
+  // Prefer explicit email from the request; otherwise fall back to WinTeam employee email.
+  const emailForCv = (() => {
+    const e1 = String(emailRaw || "").trim();
+    if (e1 && /@/.test(e1)) return e1;
+    const e2 = String(employee?.emailAddress || "").trim();
+    return (e2 && /@/.test(e2)) ? e2 : "";
+  })();
+  
   const cvFriendly = {
     division,
     department,
@@ -1584,7 +1596,7 @@ async function handleZvaAbsenceWrite(req, env) {
     endTime: endNice,
     timeInOut: timeInOutForCv,
     zoomGuid: "",
-    email,
+    email: emailForCv,
     phone: employee?.phone1 || "",
     callerId,
     dateTime: nowISO,
@@ -1595,8 +1607,12 @@ async function handleZvaAbsenceWrite(req, env) {
   const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
   const cvString = JSON.stringify(columnValues);
 
+  // const deKeyWho = (employeeNumber || fullName || callerId || "unknown").toLowerCase();
+  // const dedupeKey = `absence|${deKeyWho}|${(dateHint || "nodate")}|${reasonSlug}`;
+
   const deKeyWho = (employeeNumber || fullName || callerId || "unknown").toLowerCase();
   const dedupeKey = `absence|${deKeyWho}|${(dateHint || "nodate")}|${reasonSlug}`;
+  
   if (await flowGuardSeen(env, dedupeKey)) {
     return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false });
   }
