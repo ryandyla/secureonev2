@@ -1565,13 +1565,13 @@ async function handleZvaAbsenceWrite(req, env) {
 
   const reasonBlock = [
     absenceType,
-    `Reason: ${callreason}`,
-    dateHint ? `Date: ${dateHint}` : null,
+    `Reason: ${callreason}`
+    /**dateHint ? `Date: ${dateHint}` : null,
     siteForCv ? `Site: ${siteForCv}` : null,
     (startNice || endNice) ? `Time: ${startNice || "?"} → ${endNice || "?"}` : null,
     timeInOutForCv ? `Time In/Out: ${timeInOutForCv}` : null,
     hours ? `Hours: ${hours}` : null,
-    notes ? `Notes: ${notes}` : null
+    notes ? `Notes: ${notes}` : null*/
   ].filter(Boolean).join("\n");
 
   const cvFriendly = {
