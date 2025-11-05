@@ -197,6 +197,39 @@ async function fetchShiftByDateViaSelf(req, env, { employeeNumber, ymdDate }) {
   } : null;
 }
 
+// Classify the user's reason with strict patterns.
+function classifyReason(raw) {
+  const r = String(raw || "").toLowerCase();
+
+  const resignationTerms = [
+    /resign/, /resignation/, /quit/, /two\s*weeks/, /my\s*last\s*day/,
+    /no\s*longer\s*work/, /i'?m\s*leaving\s*the\s*company/, /terminate\s*my\s*employment/
+  ];
+
+  const earlyOutTerms = [
+    /leave\s*early/, /going\s*home\s*early/, /head\s*out\s*early/,
+    /off\s*early/, /left\s*early/, /need\s*to\s*go\s*early/
+  ];
+
+  const absenceTerms = [
+    /call(?:ing)?\s*off/, /sick/, /not\s*coming\s*in/, /can'?t\s*make\s*it/,
+    /no\s*show/, /miss(?:ing)?\s*shift/, /family\s*emergency/
+  ];
+
+  if (resignationTerms.some(rx => rx.test(r))) return "resignation";
+  if (earlyOutTerms.some(rx => rx.test(r)))    return "early_out";
+  if (absenceTerms.some(rx => rx.test(r)))     return "absence";
+  return "unknown";
+}
+
+// Require verified identity (e.g., from your Monday/WinTeam auth tool)
+function requireVerifiedIdentity(body) {
+  // Accept either an explicit verified=true or presence of ssnLast4 + successful auth upstream.
+  const verified = Boolean(body?.verified);
+  const hasSSN   = typeof body?.ssnLast4 === "string" && body.ssnLast4.trim().length === 4;
+  return verified || hasSSN;
+}
+
 // --- resignation helpers ---
 const QUIT_WORDS = [
   "quit","resign","resignation","two weeks","2 weeks","notice",
@@ -1020,11 +1053,11 @@ async function handleZvaShiftWrite(req, env) {
   if (body?.data && typeof body.data === "object") body = body.data;
 
   const employeeNumber = String(body.employeeNumber || "").trim();
-  const selectionIndex = Number(body.selectionIndex ?? 0) || 0;
+  // const selectionIndex = Number(body.selectionIndex ?? 0) || 0;
   const reason         = String(body.callreason ?? "calling off sick").trim();
   const aniRaw         = String(body.ani || body.callerId || "").trim();
-  const engagementId   = String(body.engagementId || "").trim();
-  const pageStart      = Number(body.pageStart ?? 0) || 0;
+  // const engagementId   = String(body.engagementId || "").trim();
+  // const pageStart      = Number(body.pageStart ?? 0) || 0;
 
   if (!employeeNumber) return json({ success:false, message:"employeeNumber required" }, { status:400 });
 
@@ -1075,6 +1108,247 @@ async function handleZvaShiftWrite(req, env) {
 
   return json({ success: !!mData?.success, message: mData?.message || "Done.", sent: { itemName, dedupeKey, site, startISO, endISO, callerId, reason, engagementId }, monday: mData }, { status: mData?.success ? 200 : 500 });
 }
+
+// ---------- Shared utils (place once in your worker) ----------
+function json(status, obj) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+// Classify the user's free-text reason into buckets we can enforce against.
+function classifyReason(raw) {
+  const r = String(raw || "").toLowerCase();
+
+  const resignationTerms = [
+    /resign/, /resignation/, /quit/, /two\s*weeks/, /my\s*last\s*day/,
+    /no\s*longer\s*work/, /i'?m\s*leaving\s*the\s*company/, /terminate\s*my\s*employment/
+  ];
+
+  const earlyOutTerms = [
+    /leave\s*early/, /going\s*home\s*early/, /head\s*out\s*early/,
+    /off\s*early/, /left\s*early/, /need\s*to\s*go\s*early/
+  ];
+
+  const absenceTerms = [
+    /call(?:ing)?\s*off/, /sick/, /not\s*coming\s*in/, /can'?t\s*make\s*it/,
+    /no\s*show/, /miss(?:ing)?\s*shift/, /family\s*emergency/
+  ];
+
+  if (resignationTerms.some(rx => rx.test(r))) return "resignation";
+  if (earlyOutTerms.some(rx => rx.test(r)))    return "early_out";
+  if (absenceTerms.some(rx => rx.test(r)))     return "absence";
+  return "unknown";
+}
+
+// Require verified identity (flag from upstream auth, or providing last4)
+function requireVerifiedIdentity(body) {
+  const verified = Boolean(body?.verified);
+  const hasSSN = typeof body?.ssnLast4 === "string" && body.ssnLast4.trim().length === 4;
+  return verified || hasSSN;
+}
+
+// Safe string helpers
+const s = v => (v == null ? "" : String(v).trim());
+const toISODateOnly = (v) => s(v).replace(/T.*/, ""); // keep yyyy-mm-dd if an ISO comes in
+
+
+// ---------- QUIT / RESIGNATION HANDLER ----------
+/**
+ * handleZvaQuitWrite
+ * Enforces: must look like a resignation AND identity must be verified.
+ * Expected body:
+ * {
+ *   employeeNumber: "1118", ssnLast4?: "1234", verified?: true,
+ *   callreason: "I want to resign", lastDay: "2025-11-05",
+ *   ofcFullname?: "", email?: "", callerId?: "", notes?: "", groupId?: ""
+ * }
+ */
+export async function handleZvaQuitWrite(req, env, ctx) {
+  const body = await req.json().catch(() => ({}));
+
+  const employeeNumber = s(body.employeeNumber);
+  const callreason     = s(body.callreason);
+  const lastDay        = toISODateOnly(body.lastDay || body.dateHint);
+  const fullname       = s(body.ofcFullname);
+  const email          = s(body.email);
+  const callerId       = s(body.callerId);
+  const notes          = s(body.notes);
+  const groupId        = s(body.groupId);
+
+  if (!employeeNumber) return json(422, { ok:false, message:"employeeNumber is required." });
+  if (!callreason)     return json(422, { ok:false, message:"callreason is required." });
+
+  const reasonClass = classifyReason(callreason);
+  if (reasonClass !== "resignation") {
+    return json(422, {
+      ok: false,
+      message: "This does not appear to be a resignation. Use absence-write for call-offs or leaving early.",
+      reasonClass
+    });
+  }
+
+  if (!requireVerifiedIdentity(body)) {
+    return json(401, {
+      ok: false,
+      message: "Identity verification required for resignation. Please authenticate with employeeNumber + last4 SSN.",
+    });
+  }
+
+  if (!lastDay) {
+    return json(422, {
+      ok:false,
+      message:"lastDay is required for resignation."
+    });
+  }
+
+  // Build a stable dedupe key (per your pattern)
+  const dedupeKey = `quit|${employeeNumber}|${lastDay}`;
+
+  // Compose your Monday write payload (minimal fields shown; map to your columns)
+  const mondayPayload = {
+    employeeNumber,
+    fullname,
+    lastDay,
+    callreason,
+    verified: true,
+    email,
+    callerId,
+    notes,
+    groupId,
+    dedupeKey,
+    // Optional: set a clear summary text for your "Reason" block
+    summaryText: `Resignation\nReason: ${callreason}\nLast day: ${lastDay}\nIdentity: Verified`,
+  };
+
+  // ---- IMPLEMENTATION NOTE ----
+  // Replace the following line with your actual write function.
+  // It should return { ok, item, message } or throw on error.
+  const writeResult = await writeResignationToMonday(env, mondayPayload);
+
+  if (!writeResult?.ok) {
+    return json(500, { ok:false, message: writeResult?.message || "Failed to write resignation to Monday." });
+  }
+
+  return json(200, {
+    success: true,
+    message: writeResult.message || "Resignation recorded in Monday.",
+    item: writeResult.item,
+    dedupeKey,
+    columnValuesSent: writeResult.columnValuesSent,
+  });
+}
+
+
+// ---------- ABSENCE / CALL-OFF / LEAVE-EARLY HANDLER ----------
+/**
+ * handleZvaAbsenseWrite (spelled to match your request)
+ * Routes "leave early" into Leave Early type; blocks accidental resignations.
+ * Expected body:
+ * {
+ *   employeeNumber: "1118",
+ *   callreason: "leaving early for shopping",
+ *   dateHint?: "2025-11-05",
+ *   selectedCellId?: "148904",  // preferred for early out
+ *   startTime?: "2025-11-05T14:00:00Z",
+ *   endTime?:   "2025-11-05T22:00:00Z",
+ *   hours?: "2",
+ *   siteHint?: "", notes?: "", email?: "", callerId?: "", groupId?: ""
+ * }
+ */
+export async function handleZvaAbsenseWrite(req, env, ctx) {
+  const body = await req.json().catch(() => ({}));
+
+  const employeeNumber = s(body.employeeNumber);
+  const callreason     = s(body.callreason);
+  const siteHint       = s(body.siteHint);
+  const email          = s(body.email);
+  const callerId       = s(body.callerId);
+  const notes          = s(body.notes);
+  const groupId        = s(body.groupId);
+
+  if (!employeeNumber) return json(422, { ok:false, message:"employeeNumber is required." });
+  if (!callreason)     return json(422, { ok:false, message:"callreason is required." });
+
+  // Determine the date we are writing against
+  const date = toISODateOnly(body.dateHint) || toISODateOnly(new Date().toISOString());
+
+  // Reason classification
+  const reasonClass = classifyReason(callreason);
+  if (reasonClass === "resignation") {
+    // Keep resignations out of absence-write entirely
+    return json(422, {
+      ok:false,
+      message:"Resignation requests must use quit-write (with identity verification).",
+      reasonClass
+    });
+  }
+
+  // Normalize type/labels
+  let absenceType = "Call Off";
+  if (reasonClass === "early_out") absenceType = "Leave Early";
+  if (reasonClass === "absence")   absenceType = "Absence / Call Off";
+
+  // Time/shift details
+  const selectedCellId = s(body.selectedCellId);
+  const startTime = s(body.startTime);
+  const endTime   = s(body.endTime);
+  const hours     = s(body.hours);
+
+  // For "Leave Early", require at least a shift reference or times
+  if (reasonClass === "early_out" && !selectedCellId && !startTime && !endTime) {
+    return json(422, {
+      ok:false,
+      message:"Leaving early requires either a selectedCellId or start/end times.",
+    });
+  }
+
+  // Build a dedupe key with a coarse reason slug
+  const reasonSlug = (reasonClass === "early_out") ? "leave_early"
+                   : (reasonClass === "absence")   ? "absence"
+                   : "other";
+  const dedupeKey = `absence|${employeeNumber}|${date}|${reasonSlug}`;
+
+  // Compose Monday payload
+  const mondayPayload = {
+    employeeNumber,
+    date,
+    absenceType,          // e.g., "Leave Early" or "Absence / Call Off"
+    callreason,
+    siteHint,
+    selectedCellId,       // if provided we can enrich from WinTeam later
+    startTime,
+    endTime,
+    hours,
+    email,
+    callerId,
+    notes,
+    groupId,
+    dedupeKey,
+    // Optional composite text for your long-text column:
+    // (adjust to your actual column mapping inside writeAbsenceToMonday)
+    summaryText: `${absenceType}\nReason: ${callreason}\nDate: ${date}${siteHint ? `\nSite: ${siteHint}` : ""}${(startTime||endTime) ? `\nTime: ${startTime || "?"} → ${endTime || "?"}` : ""}`,
+  };
+
+  // ---- IMPLEMENTATION NOTE ----
+  // Replace the following line with your actual write function.
+  // It should return { ok, item, message, columnValuesSent } or throw on error.
+  const writeResult = await writeAbsenceToMonday(env, mondayPayload);
+
+  if (!writeResult?.ok) {
+    return json(500, { ok:false, message: writeResult?.message || "Failed to write absence to Monday." });
+  }
+
+  return json(200, {
+    success: true,
+    message: writeResult.message || "Absence recorded in Monday.",
+    item: writeResult.item,
+    dedupeKey,
+    columnValuesSent: writeResult.columnValuesSent,
+  });
+}
+
 
 // Preferred: write by cellId
 async function handleZvaShiftWriteByCell(req, env) {
@@ -1573,7 +1847,7 @@ async function handleZvaQuitWrite(req, env) {
   const notesExtra     = s(body.notes || body.note || body.details || "");
   const lastDayHint    = s(body.quitLastDay || body.lastDay || body.dateHint || "");
   const ssnLast4       = s(body.ssnLast4 || "");
-
+  
   const groupId        = s(body.groupId || "");
 
   if (!employeeNumber && !(ofcFullname && aniRaw)) {
