@@ -1537,8 +1537,8 @@ async function handleZvaAbsenceWrite(req, env) {
   }
 
   const nowISO    = new Date().toISOString();
-  const itemWho   = employeeNumber ? `${employeeNumber} | ${fullName}` : fullName || callerId || "Unknown";
-  const itemName  = `${itemWho} (${absenceType})${dateHint ? ` — ${dateHint}` : ""}`;
+  const itemName   = employeeNumber ? `${employeeNumber} | ${fullName}` : fullName || callerId || "Unknown";
+  // const   = `${itemWho} (${absenceType})${dateHint ? ` — ${dateHint}` : ""}`;
 
   let siteForCv = siteHint;
   let startNice = "";
@@ -1714,7 +1714,7 @@ async function handleZvaQuitWrite(req, env) {
                   || STATE_FULL[(employee?.workstate || "").toUpperCase()] 
                   || s(employee?.workstate);
 
-  const itemName = `${employeeNumber || "UNKNOWN"} | ${fullName} (Resignation — Verified)`;
+  const itemName = `${employeeNumber || "UNKNOWN"} | ${fullName}`;
 
   const boardId = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) return json({ success:false, message:"boardId missing (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID in env)." }, { status:400 });
