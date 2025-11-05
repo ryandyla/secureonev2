@@ -197,30 +197,46 @@ async function fetchShiftByDateViaSelf(req, env, { employeeNumber, ymdDate }) {
   } : null;
 }
 
-// Classify the user's reason with strict patterns.
-function classifyReason(raw) {
-  const r = String(raw || "").toLowerCase();
+  // Classify the user's reason with strict patterns.
+  function classifyReason(raw) {
+    const r = String(raw || "").toLowerCase();
+  
+    // Resignation signals
+    const resignationTerms = [
+      /resign/, /resignation/, /quit/, /two\s*weeks/, /my\s*last\s*day/,
+      /no\s*longer\s*work/, /i'?m\s*leaving\s*the\s*company/, /terminate\s*my\s*employment/
+    ];
+  
+    // Early out signals (accept leave|leaving early)
+    const earlyOutTerms = [
+      /leav(?:e|ing)\s*early/,
+      /going\s*home\s*early/,
+      /head(?:ing)?\s*out\s*early/,
+      /off\s*early/,
+      /left\s*early/,
+      /need\s*to\s*go\s*early/
+    ];
 
-  const resignationTerms = [
-    /resign/, /resignation/, /quit/, /two\s*weeks/, /my\s*last\s*day/,
-    /no\s*longer\s*work/, /i'?m\s*leaving\s*the\s*company/, /terminate\s*my\s*employment/
-  ];
-
-  const earlyOutTerms = [
-    /leave\s*early/, /going\s*home\s*early/, /head\s*out\s*early/,
-    /off\s*early/, /left\s*early/, /need\s*to\s*go\s*early/
-  ];
-
-  const absenceTerms = [
-    /call(?:ing)?\s*off/, /sick/, /not\s*coming\s*in/, /can'?t\s*make\s*it/,
-    /no\s*show/, /miss(?:ing)?\s*shift/, /family\s*emergency/
-  ];
-
-  if (resignationTerms.some(rx => rx.test(r))) return "resignation";
-  if (earlyOutTerms.some(rx => rx.test(r)))    return "early_out";
-  if (absenceTerms.some(rx => rx.test(r)))     return "absence";
-  return "unknown";
-}
+    const lateInTerms = [
+      /\b(runn?ing|be|am|i'?m|arriv(?:e|ing)|come|coming|show(?:ing)?\s*up|start(?:ing)?)\s+late\b/,
+      /\b(?:mins?|minutes?)\s*late\b/,
+      /\blate\s+by\s+\d+\s*(?:mins?|minutes?)\b/,
+      /\b(delay|delayed|traffic|bus\s*delay|train\s*delay|car\s*trouble).*\blate\b/,
+      /\b(i'?ll|i\s*will)\s+be\s+\d+\s*(?:mins?|minutes?)\s+late\b/
+    ];
+    
+    // Absence/call-off signals
+    const absenceTerms = [
+      /call(?:ing)?\s*off/, /sick/, /not\s*coming\s*in/, /can'?t\s*make\s*it/,
+      /no\s*show/, /miss(?:ing)?\s*shift/, /family\s*emergency/
+    ];
+  
+    if (resignationTerms.some(rx => rx.test(r))) return "resignation";
+    if (earlyOutTerms.some(rx => rx.test(r)))    return "early_out";
+    if (absenceTerms.some(rx => rx.test(r)))     return "absence";
+    if (lateInTerms.some(rx => rx.test(r)))      return "late_in";
+    return "unknown";
+  }
 
 // resignation keyword helper for legacy paths
 const QUIT_WORDS = [
@@ -1430,9 +1446,16 @@ async function handleZvaAbsenceWrite(req, env) {
   if (reasonClass === "resignation") {
     return json({ success:false, message:"Resignation requests must use quit-write (with identity verification).", reasonClass }, { status:422 });
   }
-  let absenceType = "Call Off";
-  if (reasonClass === "early_out") absenceType = "Leave Early";
-  if (reasonClass === "absence")   absenceType = "Absence / Call Off";
+  
+let absenceType = "Call Off";
+if (reasonClass === "early_out") absenceType = "Leave Early";
+if (reasonClass === "absence")   absenceType = "Absence / Call Off";
+if (reasonClass === "late_in")   absenceType = "Late Arrival";
+
+const reasonSlug = (reasonClass === "early_out") ? "leave_early"
+                 : (reasonClass === "absence")   ? "absence"
+                 : (reasonClass === "late_in")   ? "late_in"
+                 : "other";
 
   // Enrich via WinTeam
   let employee = null;
