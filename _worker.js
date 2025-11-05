@@ -1499,10 +1499,10 @@ async function handleZvaAbsenceWrite(req, env) {
   if (reasonClass === "absence")   absenceType = "Absence / Call Off";
   if (reasonClass === "late_in")   absenceType = "Late Arrival";
 
-  // const reasonSlug = (reasonClass === "early_out") ? "leave_early"
-  //                  : (reasonClass === "absence")   ? "absence"
-  //                  : (reasonClass === "late_in")   ? "late_in"
-  //                  : "other";
+  const reasonSlug = (reasonClass === "early_out") ? "leave_early"
+                   : (reasonClass === "absence")   ? "absence"
+                   : (reasonClass === "late_in")   ? "late_in"
+                   : "other";
 
   // Enrich via WinTeam
   let employee = null;
