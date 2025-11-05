@@ -1711,7 +1711,7 @@ async function handleZvaQuitWriteSimple(req, env) {
   const department = "Operations"; // change if you prefer "HR"
   const deptEmail  = deriveDepartmentEmail(employee?.supervisorDescription || "", department);
 
-  const itemName = `${employeeNumber} | ${fullName || "Unknown"} (Resignation — Simple)`;
+  const itemName = `QUIT | ${employeeNumber} | ${fullName || "Unknown"}`;
   const boardId  = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) return json({ success:false, message:"boardId missing (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID)." }, { status:400 });
 
