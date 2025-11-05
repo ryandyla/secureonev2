@@ -1666,6 +1666,129 @@ async function handleZvaAbsenceWrite(req, env) {
   }, { status: 200 });
 }
 
+// --- /zva/quit-write-simple (no SSN verification; uses auth/employee info) ---
+async function handleZvaQuitWriteSimple(req, env) {
+  let body = await readJson(req);
+  if (body?.json && typeof body.json === "object") body = body.json;
+  if (body?.data && typeof body.data === "object") body = body.data;
+
+  const S  = (v) => (v == null ? "" : String(v).trim());
+  const employeeNumber = S(body.employeeNumber || body.ofcEmployeeNumber || "");
+  const lastDayRaw     = S(body.quitLastDay || body.lastDay || body.dateHint || "");
+  const reasonRaw      = S(body.callreason || body.reason || "Resignation");
+  const notesExtra     = S(body.notes || body.note || body.details || "");
+  const aniRaw         = S(body.ani || body.callerId || "");
+  const groupId        = S(body.groupId || "");
+  const engagementId   = S(body.engagementId || body.zoomGuid || "");
+
+  if (!employeeNumber) {
+    return json({ success:false, message:"employeeNumber is required." }, { status:400 });
+  }
+  if (!lastDayRaw) {
+    return json({ success:false, message:"lastDay is required (e.g., '11/15', 'next Friday', '2025-11-15')." }, { status:400 });
+  }
+
+  // Friendly -> YYYY-MM-DD
+  let lastDayISO = "";
+  const friendly = parseFriendlyDate(lastDayRaw);
+  if (friendly) lastDayISO = friendly;
+  if (!lastDayISO) {
+    const d = new Date(lastDayRaw);
+    if (!isNaN(d)) lastDayISO = ymd(d);
+  }
+  if (!lastDayISO) {
+    return json({ success:false, message:`Could not parse last day: "${lastDayRaw}"` }, { status:422 });
+  }
+
+  // WinTeam enrichment
+  let employee = null;
+  try { employee = await fetchEmployeeDetail(employeeNumber, env); } catch {}
+  const fullName = S(employee?.fullName || "");
+  const callerId = normalizeUsPhone(aniRaw);
+  const division = stateFromSupervisor(employee?.supervisorDescription || "") 
+                || STATE_FULL[(employee?.workstate || "").toUpperCase()] 
+                || S(employee?.workstate);
+  const department = "Operations"; // change if you prefer "HR"
+  const deptEmail  = deriveDepartmentEmail(employee?.supervisorDescription || "", department);
+
+  const itemName = `${employeeNumber} | ${fullName || "Unknown"} (Resignation — Simple)`;
+  const boardId  = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
+  if (!boardId) return json({ success:false, message:"boardId missing (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID)." }, { status:400 });
+
+  const dedupeKey = `quit_simple|${employeeNumber}|${lastDayISO}`;
+  if (await flowGuardSeen(env, dedupeKey)) {
+    return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false });
+  }
+
+  const nowISO = new Date().toISOString();
+  const reasonBlock = [
+    "Resignation (Simple)",
+    `Last day: ${lastDayISO}`,
+    reasonRaw && `Reason: ${reasonRaw}`,
+    notesExtra && `Notes: ${notesExtra}`
+  ].filter(Boolean).join("\n");
+
+  const cvFriendly = {
+    division,
+    department,
+    deptEmail,
+    reason: reasonBlock,
+    dateTime: nowISO,
+    email: S(employee?.emailAddress || ""),   // <-- from auth/employee data
+    phone: S(employee?.phone1 || ""),
+    callerId,
+    zoomGuid: engagementId || ""
+  };
+  const columnValues = buildMondayColumnsFromFriendly(cvFriendly);
+  const cvString = JSON.stringify(columnValues);
+
+  // Create item then set columns
+  const createMutation = `
+    mutation ($boardId: ID!, $itemName: String!, $groupId: String) {
+      create_item (board_id: $boardId, item_name: $itemName, group_id: $groupId) {
+        id name board { id } group { id }
+      }
+    }`;
+  let created;
+  try {
+    const res = await mondayGraphQL(env, createMutation, { boardId, itemName, groupId: groupId || null });
+    created = res.create_item;
+  } catch (e) {
+    return json({ success:false, message:"Monday create_item failed.", detail:String(e) }, { status:502 });
+  }
+
+  if (Object.keys(columnValues).length) {
+    const changeMutation = `
+      mutation ($boardId: ID!, $itemId: ID!, $cv: JSON!) {
+        change_multiple_column_values (board_id: $boardId, item_id: $itemId, column_values: $cv) { id name }
+      }`;
+    try {
+      await mondayGraphQL(env, changeMutation, { boardId, itemId: String(created.id), cv: cvString });
+    } catch (e) {
+      return json({ success:false, message:"Monday change_multiple_column_values failed.", createdItem: created, detail:String(e) }, { status:502 });
+    }
+  }
+
+  await flowGuardMark(env, dedupeKey);
+
+  console.log(`✅ ZVA QUIT SIMPLE SUMMARY: ${JSON.stringify({
+    employeeNumber,
+    fullname: fullName || null,
+    lastDay: lastDayISO,
+    deptEmail,
+    mondayItemId: created?.id || null,
+    dedupeKey
+  }, null, 2)}`);
+
+  return json({
+    success: true,
+    message: "Resignation recorded in Monday (simple).",
+    item: created,
+    dedupeKey,
+    columnValuesSent: columnValues
+  }, { status: 200 });
+}
+
 // Resignation writer: requires resignation intent + SSN verification
 async function handleZvaQuitWrite(req, env) {
   let body = await readJson(req);
@@ -1835,6 +1958,8 @@ export default {
     if (method === "POST" && path === "/zva/shift-write-by-cell") return await handleZvaShiftWriteByCell(req, env);
     if (method === "POST" && path === "/zva/quit-write")          return await handleZvaQuitWrite(req, env);
     if (method === "POST" && path === "/zva/absence-write")       return await handleZvaAbsenceWrite(req, env);
+    if (method === "POST" && path === "/zva/quit-write-simple")   return await handleZvaQuitWriteSimple(req, env);
+
   
     return json({ success:false, message:"Not found. Use POST /auth/employee, /winteam/shifts, /monday/write, /zva/shift-write, /zva/shift-write-by-cell, /zva/quit-write, /zva/absence-write" }, { status:404 });
   })
