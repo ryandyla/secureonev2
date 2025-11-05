@@ -197,46 +197,46 @@ async function fetchShiftByDateViaSelf(req, env, { employeeNumber, ymdDate }) {
   } : null;
 }
 
-  // Classify the user's reason with strict patterns.
-  function classifyReason(raw) {
-    const r = String(raw || "").toLowerCase();
-  
-    // Resignation signals
-    const resignationTerms = [
-      /resign/, /resignation/, /quit/, /two\s*weeks/, /my\s*last\s*day/,
-      /no\s*longer\s*work/, /i'?m\s*leaving\s*the\s*company/, /terminate\s*my\s*employment/
-    ];
-  
-    // Early out signals (accept leave|leaving early)
-    const earlyOutTerms = [
-      /leav(?:e|ing)\s*early/,
-      /going\s*home\s*early/,
-      /head(?:ing)?\s*out\s*early/,
-      /off\s*early/,
-      /left\s*early/,
-      /need\s*to\s*go\s*early/
-    ];
+//
+// Reason classifier + time phrase extraction
+//
+function classifyReason(raw) {
+  const r = String(raw || "").toLowerCase();
 
-    const lateInTerms = [
-      /\b(runn?ing|be|am|i'?m|arriv(?:e|ing)|come|coming|show(?:ing)?\s*up|start(?:ing)?)\s+late\b/,
-      /\b(?:mins?|minutes?)\s*late\b/,
-      /\blate\s+by\s+\d+\s*(?:mins?|minutes?)\b/,
-      /\b(delay|delayed|traffic|bus\s*delay|train\s*delay|car\s*trouble).*\blate\b/,
-      /\b(i'?ll|i\s*will)\s+be\s+\d+\s*(?:mins?|minutes?)\s+late\b/
-    ];
-    
-    // Absence/call-off signals
-    const absenceTerms = [
-      /call(?:ing)?\s*off/, /sick/, /not\s*coming\s*in/, /can'?t\s*make\s*it/,
-      /no\s*show/, /miss(?:ing)?\s*shift/, /family\s*emergency/
-    ];
-  
-    if (resignationTerms.some(rx => rx.test(r))) return "resignation";
-    if (earlyOutTerms.some(rx => rx.test(r)))    return "early_out";
-    if (absenceTerms.some(rx => rx.test(r)))     return "absence";
-    if (lateInTerms.some(rx => rx.test(r)))      return "late_in";
-    return "unknown";
-  }
+  const resignationTerms = [
+    /resign/, /resignation/, /quit/, /two\s*weeks/, /my\s*last\s*day/,
+    /no\s*longer\s*work/, /i'?m\s*leaving\s*the\s*company/, /terminate\s*my\s*employment/
+  ];
+
+  const earlyOutTerms = [
+    /leav(?:e|ing)\s*early/,
+    /going\s*home\s*early/,
+    /head(?:ing)?\s*out\s*early/,
+    /off\s*early/,
+    /left\s*early/,
+    /need\s*to\s*go\s*early/,
+    /leave\s+by\s+\d+(:\d{2})?\s*(am|pm)\b/
+  ];
+
+  const lateInTerms = [
+    /\b(runn?ing|be|am|i'?m|arriv(?:e|ing)|come|coming|show(?:ing)?\s*up|start(?:ing)?)\s+late\b/,
+    /\b(?:mins?|minutes?)\s*late\b/,
+    /\blate\s+by\s+\d+\s*(?:mins?|minutes?)\b/,
+    /\b(delay|delayed|traffic|bus\s*delay|train\s*delay|car\s*trouble).*\blate\b/,
+    /\b(i'?ll|i\s*will)\s+be\s+\d+\s*(?:mins?|minutes?)\s+late\b/
+  ];
+
+  const absenceTerms = [
+    /call(?:ing)?\s*off/, /sick/, /not\s*coming\s*in/, /can'?t\s*make\s*it/,
+    /no\s*show/, /miss(?:ing)?\s*shift/, /family\s*emergency/
+  ];
+
+  if (resignationTerms.some(rx => rx.test(r))) return "resignation";
+  if (earlyOutTerms.some(rx => rx.test(r)))    return "early_out";
+  if (absenceTerms.some(rx => rx.test(r)))     return "absence";
+  if (lateInTerms.some(rx => rx.test(r)))      return "late_in";
+  return "unknown";
+}
 
 // resignation keyword helper for legacy paths
 const QUIT_WORDS = [
@@ -248,6 +248,43 @@ function isResignationish(s) {
   if (!s) return false;
   const t = String(s).toLowerCase();
   return QUIT_WORDS.some(w => t.includes(w));
+}
+
+// Parse time-phrases to populate the Time In/Out column
+function extractTimeInOutPhrase(text) {
+  const s = String(text || "").toLowerCase();
+
+  // e.g., "30 minutes late", "15 mins late", "i'll be 20 minutes late"
+  let m = s.match(/\b(\d{1,3})\s*(minutes?|mins?)\s+late\b/);
+  if (m) return `Late +${m[1]}m`;
+
+  // e.g., "late by 10 minutes"
+  m = s.match(/\blate\s+by\s+(\d{1,3})\s*(minutes?|mins?)\b/);
+  if (m) return `Late +${m[1]}m`;
+
+  // e.g., "an hour early", "1 hour early", "2 hours early"
+  m = s.match(/\b((an|\d{1,2}))\s*hour(s)?\s+early\b/);
+  if (m) {
+    const n = m[2] === "an" ? 1 : Number(m[1]) || 1;
+    return `Leave early -${n}h`;
+  }
+
+  // e.g., "leave by 8pm", "leave by 8:30 pm"
+  m = s.match(/\bleave\s+by\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+  if (m) {
+    let h = Number(m[1]);
+    const min = Number(m[2] || 0);
+    const ap = m[3];
+    if (ap === "pm" && h !== 12) h += 12;
+    if (ap === "am" && h === 12) h = 0;
+    return `Leave by ${pad2(h)}:${pad2(min)}`;
+  }
+
+  // e.g., "i'll be 45 minutes late"
+  m = s.match(/\bi'?ll\s+be\s+(\d{1,3})\s*(minutes?|mins?)\s+late\b/);
+  if (m) return `Late +${m[1]}m`;
+
+  return ""; // nothing detected
 }
 
 ///////////////////////////////
@@ -955,12 +992,15 @@ async function handleMondayWrite(req, env) {
     }
   }
 
+  // capture phrase if present
+  const timeInOutForCv = trim(body.timeInOut || body.ofctimeinorout || body.timeinorout || extractTimeInOutPhrase(callreason));
+
   const cvFriendly = {
     ofcWorkstate,
     ofcWorksite,
     site: body.site,
     reason: callreason,
-    timeInOut: body.timeInOut || body.ofctimeinorout,
+    timeInOut: timeInOutForCv,
     startTime: body.startTime,
     endTime: body.endTime,
     zoomGuid: engagementId || "",
@@ -1044,7 +1084,7 @@ async function handleMondayWrite(req, env) {
   return json({ success:true, message:"Monday item created/updated.", mode, boardId, item: created, dedupeKey: dedupeKey || null, engagementId: engagementId || null, columnValuesSent: columnValues });
 }
 
-// Legacy write (by selection index) — FIXED
+// Legacy write (by selection index)
 async function handleZvaShiftWrite(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -1095,7 +1135,10 @@ async function handleZvaShiftWrite(req, env) {
   };
   const callerId = normPhone(aniRaw);
 
-  const mondayBody = { itemName, dedupeKey, site, shiftStart: startISO, shiftEnd: endISO, callerId, callreason: reason, engagementId };
+  // push parsed phrase to timeInOut too
+  const timeInOutForCv = extractTimeInOutPhrase(reason);
+
+  const mondayBody = { itemName, dedupeKey, site, shiftStart: startISO, shiftEnd: endISO, callerId, callreason: reason, timeInOut: timeInOutForCv, engagementId };
 
   let mResp, mData;
   try {
@@ -1216,13 +1259,16 @@ async function handleZvaShiftWriteByCell(req, env) {
   const endNice   = fmtYmdHmUTC(endISO);
   const nowISO    = new Date().toISOString();
 
+  // parse a phrase if present
+  const timeInOutForCv = ofctimeinorout || extractTimeInOutPhrase(reason);
+
   const cvFriendly = {
     site,
     reason: reason,
     callerId,
     startTime: startNice,
     endTime: endNice,
-    timeInOut: ofctimeinorout,
+    timeInOut: timeInOutForCv,
     zoomGuid: engagementId || "",
     shift: `${startNice} → ${endNice} @ ${site || ""}`.trim(),
     division,
@@ -1270,7 +1316,7 @@ async function handleZvaShiftWriteByCell(req, env) {
       cellId,
       site,
       date: (startISO || "").slice(0, 10),
-      timeInOut: ofctimeinorout || "",
+      timeInOut: timeInOutForCv || "",
       reason,
       department,
       deptEmail,
@@ -1389,7 +1435,7 @@ async function fetchEarliestShiftOnDateViaSelf(req, env, { employeeNumber, ymdDa
   }
 }
 
-// --- /zva/absence-write (UPGRADED & fixed item naming) ---
+// --- /zva/absence-write (UPGRADED & timeInOut capture)
 async function handleZvaAbsenceWrite(req, env) {
   // Read + normalize
   let body = await readJson(req);
@@ -1446,16 +1492,16 @@ async function handleZvaAbsenceWrite(req, env) {
   if (reasonClass === "resignation") {
     return json({ success:false, message:"Resignation requests must use quit-write (with identity verification).", reasonClass }, { status:422 });
   }
-  
-let absenceType = "Call Off";
-if (reasonClass === "early_out") absenceType = "Leave Early";
-if (reasonClass === "absence")   absenceType = "Absence / Call Off";
-if (reasonClass === "late_in")   absenceType = "Late Arrival";
 
-const reasonSlug = (reasonClass === "early_out") ? "leave_early"
-                 : (reasonClass === "absence")   ? "absence"
-                 : (reasonClass === "late_in")   ? "late_in"
-                 : "other";
+  let absenceType = "Call Off";
+  if (reasonClass === "early_out") absenceType = "Leave Early";
+  if (reasonClass === "absence")   absenceType = "Absence / Call Off";
+  if (reasonClass === "late_in")   absenceType = "Late Arrival";
+
+  const reasonSlug = (reasonClass === "early_out") ? "leave_early"
+                   : (reasonClass === "absence")   ? "absence"
+                   : (reasonClass === "late_in")   ? "late_in"
+                   : "other";
 
   // Enrich via WinTeam
   let employee = null;
@@ -1512,12 +1558,18 @@ const reasonSlug = (reasonClass === "early_out") ? "leave_early"
     return json({ success:false, message:"Leaving early requires either a selectedCellId or start/end times." }, { status:422 });
   }
 
+  // Derive Time In/Out value from inputs + phrase parsing
+  const explicitTimeInOut = S(body.timeInOut || body.ofctimeinorout || body.timeinorout || "");
+  const parsedPhrase      = extractTimeInOutPhrase(callreason) || extractTimeInOutPhrase(notes);
+  const timeInOutForCv    = explicitTimeInOut || parsedPhrase;
+
   const reasonBlock = [
     absenceType,
     `Reason: ${callreason}`,
     dateHint ? `Date: ${dateHint}` : null,
     siteForCv ? `Site: ${siteForCv}` : null,
     (startNice || endNice) ? `Time: ${startNice || "?"} → ${endNice || "?"}` : null,
+    timeInOutForCv ? `Time In/Out: ${timeInOutForCv}` : null,
     hours ? `Hours: ${hours}` : null,
     notes ? `Notes: ${notes}` : null
   ].filter(Boolean).join("\n");
@@ -1530,6 +1582,7 @@ const reasonSlug = (reasonClass === "early_out") ? "leave_early"
     site: siteForCv,
     startTime: startNice,
     endTime: endNice,
+    timeInOut: timeInOutForCv,
     zoomGuid: "",
     email,
     phone: employee?.phone1 || "",
@@ -1543,9 +1596,6 @@ const reasonSlug = (reasonClass === "early_out") ? "leave_early"
   const cvString = JSON.stringify(columnValues);
 
   const deKeyWho = (employeeNumber || fullName || callerId || "unknown").toLowerCase();
-  const reasonSlug = (reasonClass === "early_out") ? "leave_early"
-                   : (reasonClass === "absence")   ? "absence"
-                   : "other";
   const dedupeKey = `absence|${deKeyWho}|${(dateHint || "nodate")}|${reasonSlug}`;
   if (await flowGuardSeen(env, dedupeKey)) {
     return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false });
