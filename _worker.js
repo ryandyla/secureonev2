@@ -1666,7 +1666,7 @@ async function handleZvaAbsenceWrite(req, env) {
   }, { status: 200 });
 }
 
-// --- /zva/quit-write-simple (accepts date OR phrase) ---
+// --- /zva/quit-write-simple (pass-through phrase; no date parsing) ---
 async function handleZvaQuitWriteSimple(req, env) {
   let body = await readJson(req);
   if (body?.json && typeof body.json === "object") body = body.json;
@@ -1674,18 +1674,16 @@ async function handleZvaQuitWriteSimple(req, env) {
 
   const S  = (v) => (v == null ? "" : String(v).trim());
   const employeeNumber = S(body.employeeNumber || body.ofcEmployeeNumber || "");
-  // Accept either a date-like value or a phrase, plus your new alias
-  const lastDayRaw     = S(
-    body.quitLastDay ||
-    body.lastDay ||
-    body.last_day ||
-    body.dateHint ||
-    body.ofcquitlastday ||     // <--- your agent var alias
-    ""
-  );
-  const quitPhraseRaw  = S(
+
+  // Accept ANY free-form string from the agent (optional)
+  // e.g., "effective immediately", "next Friday", "11/30", "two week notice"
+  const ofcquitlastday = S(
+    body.ofcquitlastday ||
     body.quitPhrase ||
-    body.resignationPhrase ||
+    body.lastDay ||      // legacy
+    body.last_day ||     // legacy
+    body.quitLastDay ||  // legacy
+    body.dateHint ||     // legacy
     ""
   );
 
@@ -1698,56 +1696,14 @@ async function handleZvaQuitWriteSimple(req, env) {
   if (!employeeNumber) {
     return json({ success:false, message:"employeeNumber is required." }, { status:400 });
   }
-  // New behavior: allow either a date OR a phrase; only error if both are missing
-  if (!lastDayRaw && !quitPhraseRaw) {
-    return json({
-      success:false,
-      message:"Provide either lastDay (e.g., '11/15', 'next Friday', '2025-11-15') OR quitPhrase (e.g., 'effective immediately', '2 week notice')."
-    }, { status:400 });
-  }
 
-  // ---- Interpret inputs ----
-  // We’ll try to parse lastDayRaw as a friendly date (only if supplied).
-  let lastDayISO = "";
-  let phraseNorm = ""; // lowercased, normalized phrase for dedupe if no date
-  if (lastDayRaw) {
-    const friendly = parseFriendlyDate(lastDayRaw); // your helper (returns YYYY-MM-DD or "")
-    if (friendly) lastDayISO = friendly;
-    if (!lastDayISO) {
-      const d = new Date(lastDayRaw);
-      if (!isNaN(d)) lastDayISO = ymd(d); // your ymd helper -> "YYYY-MM-DD"
-    }
-    if (!lastDayISO) {
-      // If caller clearly gave a phrase like "effective immediately" in lastDayRaw, let it flow as a phrase.
-      // Otherwise, we keep old strictness & error on unparseable date-like input.
-      const txt = lastDayRaw.toLowerCase();
-      const looksPhrasey = /(immediately|two\s+weeks|2\s+week|notice|asap|soon)/.test(txt);
-      if (!looksPhrasey) {
-        return json({ success:false, message:`Could not parse last day: "${lastDayRaw}"` }, { status:422 });
-      }
-      phraseNorm = txt;
-    }
-  }
+  // Build the single-line reason string (no parsing/normalizing)
+  // If a phrase was provided, append it; else just "Resignation"
+  const reasonLine = ofcquitlastday
+    ? `Resignation: ${ofcquitlastday}`
+    : "Resignation";
 
-  // If no date was provided but a phrase was, normalize that phrase
-  if (!lastDayISO && quitPhraseRaw) {
-    phraseNorm = quitPhraseRaw.toLowerCase();
-  }
-
-  // Optional: If phrase implies a notice window and you’d like to also compute a date, do it here.
-  // (You said it doesn’t need to be a date, so keeping it optional; set computeNoticeDate = true to include.)
-  const computeNoticeDate = false;
-  if (!lastDayISO && phraseNorm && computeNoticeDate) {
-    const days = phraseNorm.includes("2 week") || phraseNorm.includes("two week") ? 14 :
-                 phraseNorm.includes("1 week") || phraseNorm.includes("one week") ? 7 : 0;
-    if (days > 0) {
-      const base = new Date(); base.setHours(0,0,0,0);
-      const d = new Date(base); d.setDate(d.getDate() + days);
-      lastDayISO = ymd(d);
-    }
-  }
-
-  // WinTeam enrichment
+  // WinTeam enrichment (non-fatal if it fails)
   let employee = null;
   try { employee = await fetchEmployeeDetail(employeeNumber, env); } catch {}
   const fullName = S(employee?.fullName || "");
@@ -1762,19 +1718,9 @@ async function handleZvaQuitWriteSimple(req, env) {
   const boardId  = String(env.MONDAY_BOARD_ID || env.MONDAY_DEFAULT_BOARD_ID || "").trim();
   if (!boardId) return json({ success:false, message:"boardId missing (set MONDAY_BOARD_ID or MONDAY_DEFAULT_BOARD_ID)." }, { status:400 });
 
-  // Build the single-line reason string you want
-  let reasonLine = "Resignation";
-  if (phraseNorm) {
-    // e.g., "Resignation: effective immediately" or "Resignation: 2 week notice"
-    reasonLine = `Resignation: ${phraseNorm}`;
-    if (lastDayISO) reasonLine += ` (Last day ${lastDayISO})`;
-  } else if (lastDayISO) {
-    reasonLine = `Resignation: Last day ${lastDayISO}`;
-  }
-
-  // Dedupe: prefer ISO date when available; otherwise a slug of the phrase
-  const phraseSlug = phraseNorm ? phraseNorm.replace(/\s+/g, "_") : "";
-  const dedupeKey = `quit_simple|${employeeNumber}|${lastDayISO || phraseSlug || "unspecified"}`;
+  // Dedupe: use a slug of the phrase if present; otherwise "unspecified"
+  const phraseSlug = ofcquitlastday ? ofcquitlastday.toLowerCase().replace(/\s+/g, "_").slice(0,64) : "unspecified";
+  const dedupeKey = `quit_simple|${employeeNumber}|${phraseSlug}`;
   if (await flowGuardSeen(env, dedupeKey)) {
     return json({ success:true, message:"Duplicate suppressed by flow guard.", dedupeKey, upserted:false });
   }
@@ -1784,7 +1730,7 @@ async function handleZvaQuitWriteSimple(req, env) {
     division,
     department,
     deptEmail,
-    reason: reasonLine,            // <--- single clean line
+    reason: reasonLine,     // <-- goes to Monday as one clean line
     dateTime: nowISO,
     email: S(employee?.emailAddress || ""),
     phone: S(employee?.phone1 || ""),
@@ -1826,8 +1772,7 @@ async function handleZvaQuitWriteSimple(req, env) {
   console.log(`✅ ZVA QUIT SIMPLE SUMMARY: ${JSON.stringify({
     employeeNumber,
     fullname: fullName || null,
-    lastDay: lastDayISO || null,
-    phrase: phraseNorm || null,
+    phrase: ofcquitlastday || null,
     deptEmail,
     mondayItemId: created?.id || null,
     dedupeKey
